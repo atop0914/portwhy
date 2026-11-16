@@ -1,0 +1,459 @@
+// Command portwhy explains why a TCP or UDP port cannot be bound.
+//
+// The command has one job and one rule: every sentence it prints has to be
+// backed by something it read or something it tried. It prints "I could not
+// tell" as its own answer, with its own exit code, because a diagnostic tool
+// that guesses is worse than one that is missing.
+package main
+
+import (
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"net/netip"
+	"os"
+	"strconv"
+	"strings"
+
+	"github.com/atop0914/portwhy/internal/procnet"
+	"github.com/atop0914/portwhy/internal/sockid"
+	"github.com/atop0914/portwhy/internal/verdict"
+	"github.com/atop0914/portwhy/internal/version"
+)
+
+// Exit codes are a contract, and the contract is the point: a script that treats
+// every non-zero code as "taken" would do the wrong thing on "could not tell".
+const (
+	exitFree    = 0
+	exitTaken   = 1
+	exitUsage   = 2
+	exitUnknown = 3
+)
+
+func main() {
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+}
+
+func run(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		_ = usage(stderr)
+		return exitUsage
+	}
+	switch args[0] {
+	case "why":
+		return runWhy(args[1:], stdout, stderr)
+	case "version", "--version":
+		return runVersion(stdout, stderr)
+	case "help", "-h", "--help":
+		_ = usage(stdout)
+		return exitFree
+	default:
+		_ = fprintf(stderr, "portwhy: unknown command %q\n\n", args[0])
+		_ = usage(stderr)
+		return exitUsage
+	}
+}
+
+func runVersion(stdout, stderr io.Writer) int {
+	if err := fprintf(stdout, "%s\n", version.Resolve().String()); err != nil {
+		_ = fprintf(stderr, "portwhy: %v\n", err)
+		return exitUsage
+	}
+	return exitFree
+}
+
+func runWhy(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("why", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	proto := fs.String("proto", "tcp", "protocol to check: tcp or udp")
+	asJSON := fs.Bool("json", false, "emit a JSON report instead of text")
+	tableDir := fs.String("tables", procnet.DefaultDir, "directory holding the kernel socket tables")
+	procRoot := fs.String("proc", sockid.DefaultRoot, "procfs root used to name the holder")
+	skipHolders := fs.Bool("no-holders", false, "do not walk /proc/<pid>/fd: kernel state only")
+
+	if err := fs.Parse(splitFlags(fs, args)); err != nil {
+		return exitUsage
+	}
+	if fs.NArg() != 1 {
+		_ = fprintf(stderr, "portwhy: why takes exactly one target, got %d\n\n", fs.NArg())
+		_ = usage(stderr)
+		return exitUsage
+	}
+
+	q, err := parseQuery(fs.Arg(0), *proto)
+	if err != nil {
+		_ = fprintf(stderr, "portwhy: %v\n", err)
+		return exitUsage
+	}
+
+	tables := procnet.ReadAll(*tableDir)
+
+	env := verdict.Env{}
+	if !*skipHolders {
+		idx, err := sockid.Scan(*procRoot)
+		if err != nil {
+			// The verdict is still buildable from kernel state; what is lost is
+			// the ability to name the holder. Say so, and keep going.
+			_ = fprintf(stderr, "portwhy: warning: cannot name holders: %v\n", err)
+		} else {
+			env.Lookup = func(s procnet.Socket) []verdict.Owner {
+				holders := idx.Holders(s.Inode)
+				out := make([]verdict.Owner, 0, len(holders))
+				for _, h := range holders {
+					out = append(out, verdict.Owner{PID: h.PID, Comm: h.Comm, FD: h.FD})
+				}
+				return out
+			}
+			env.ProcsRead = idx.ProcsRead
+			env.ProcsDenied = idx.ProcsDenied
+		}
+	}
+
+	v := verdict.Explain(q, tables, env)
+
+	if *asJSON {
+		err = renderJSON(stdout, v)
+	} else {
+		err = renderText(stdout, v)
+	}
+	if err != nil {
+		_ = fprintf(stderr, "portwhy: writing report: %v\n", err)
+		return exitUsage
+	}
+	return exitCode(v.Kind)
+}
+
+// splitFlags lets flags follow the target.
+//
+// The standard flag package stops at the first positional argument, so
+// "portwhy why :8080 -json" would silently treat "-json" as a second target.
+// That is the order people type, and a diagnostic tool that rejects the obvious
+// invocation is a diagnostic tool nobody runs twice.
+func splitFlags(fs *flag.FlagSet, args []string) []string {
+	var flags, positional []string
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			positional = append(positional, args[i+1:]...)
+			break
+		}
+		if len(arg) < 2 || arg[0] != '-' {
+			positional = append(positional, arg)
+			continue
+		}
+		flags = append(flags, arg)
+		name := strings.TrimLeft(arg, "-")
+		if strings.ContainsRune(name, '=') {
+			continue
+		}
+		f := fs.Lookup(name)
+		if f == nil {
+			// Unknown flag: hand it to Parse so it reports the error.
+			continue
+		}
+		if bf, ok := f.Value.(interface{ IsBoolFlag() bool }); ok && bf.IsBoolFlag() {
+			continue
+		}
+		if i+1 < len(args) {
+			flags = append(flags, args[i+1])
+			i++
+		}
+	}
+	// Positionals go last so that Parse leaves them in fs.Args().
+	return append(flags, positional...)
+}
+
+func exitCode(k verdict.Kind) int {
+	switch k {
+	case verdict.KindFree:
+		return exitFree
+	case verdict.KindUnknown:
+		return exitUnknown
+	default:
+		return exitTaken
+	}
+}
+
+func parseQuery(target, proto string) (verdict.Query, error) {
+	p, err := parseProto(proto)
+	if err != nil {
+		return verdict.Query{}, err
+	}
+	addr, err := parseTarget(target)
+	if err != nil {
+		return verdict.Query{}, err
+	}
+	return verdict.Query{Addr: addr, Proto: p}, nil
+}
+
+func parseProto(s string) (procnet.Proto, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "tcp":
+		return procnet.TCP, nil
+	case "udp":
+		return procnet.UDP, nil
+	}
+	return 0, fmt.Errorf("-proto %q is not tcp or udp", s)
+}
+
+// parseTarget accepts "host:port", "[v6]:port" and the bare ":port" that people
+// type when they mean "every interface".
+func parseTarget(s string) (procnet.Addr, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return procnet.Addr{}, fmt.Errorf("empty target; try 127.0.0.1:8080 or :8080")
+	}
+	if rest, ok := strings.CutPrefix(s, ":"); ok {
+		port, err := strconv.ParseUint(rest, 10, 16)
+		if err != nil {
+			return procnet.Addr{}, fmt.Errorf("target %q has no usable port", s)
+		}
+		return procnet.Addr{IP: netip.IPv4Unspecified(), Port: uint16(port)}, nil
+	}
+	ap, err := netip.ParseAddrPort(s)
+	if err != nil {
+		return procnet.Addr{}, fmt.Errorf("target %q is not host:port (try 127.0.0.1:8080 or :8080)", s)
+	}
+	// Unmap turns ::ffff:127.0.0.1 into 127.0.0.1: the table stores those rows
+	// as IPv4, and comparing a 4-in-6 address against them would silently
+	// answer "free".
+	return procnet.Addr{IP: ap.Addr().Unmap(), Port: ap.Port()}, nil
+}
+
+var kindSentence = map[verdict.Kind]string{
+	verdict.KindFree:                 "nothing in the kernel tables occupies it",
+	verdict.KindListening:            "a listening socket holds it",
+	verdict.KindTimeWaitOnly:         "only TIME_WAIT rows hold it",
+	verdict.KindOccupiedNonListening: "sockets hold it, but none of them is listening",
+	verdict.KindUnknown:              "cannot be determined from what was readable",
+}
+
+var reasonSentence = map[string]string{
+	verdict.ReasonNoSockets:       "no row in the read tables matches this address",
+	verdict.ReasonListener:        "bind() to an address a listener holds fails with EADDRINUSE",
+	verdict.ReasonTimeWait:        "the reservation belongs to a closed connection, not to a running process",
+	verdict.ReasonOtherState:      "a bound socket in a non-listening state holds this address; whether bind() fails depends on socket options",
+	verdict.ReasonTableUnreadable: "a socket table could not be read, so absence of a row proves nothing",
+	verdict.ReasonV6Wildcard:      "an IPv6 wildcard listener may also occupy IPv4, depending on net.ipv6.bindv6only",
+	verdict.ReasonNoOwnerInode:    "TIME_WAIT rows carry inode 0, so no process can be named for them",
+	verdict.ReasonProcsDenied:     "some processes could not be read, so an unnamed holder may exist",
+	verdict.ReasonProbeNotRun:     "no bind was attempted: this verdict comes from kernel state only",
+}
+
+// limitReasons are the ones that describe what the answer does not cover. They
+// are printed in their own section so the caveat is not lost in the middle of
+// the diagnosis.
+var limitReasons = map[string]bool{
+	verdict.ReasonProbeNotRun:  true,
+	verdict.ReasonProcsDenied:  true,
+	verdict.ReasonNoOwnerInode: true,
+	verdict.ReasonV6Wildcard:   true,
+}
+
+func renderText(w io.Writer, v verdict.Verdict) error {
+	if err := fprintf(w, "%s/%s — %s\n", v.Query.Addr, v.Query.Proto, kindSentence[v.Kind]); err != nil {
+		return err
+	}
+
+	if len(v.Findings) > 0 {
+		if err := fprintf(w, "\nholders\n"); err != nil {
+			return err
+		}
+		for _, f := range v.Findings {
+			if err := fprintf(w, "  %-14s %-22s %-28s inode %d\n",
+				f.Socket.State, f.Socket.Local.String(), ownerText(f), f.Socket.Inode); err != nil {
+				return err
+			}
+		}
+	}
+
+	if err := fprintf(w, "\nwhy\n"); err != nil {
+		return err
+	}
+	wrote := false
+	for _, r := range v.Reasons {
+		if limitReasons[r.Code] {
+			continue
+		}
+		if err := writeReason(w, r); err != nil {
+			return err
+		}
+		wrote = true
+	}
+	if !wrote {
+		if err := fprintf(w, "  - no further detail available\n"); err != nil {
+			return err
+		}
+	}
+
+	if err := fprintf(w, "\nlimits\n"); err != nil {
+		return err
+	}
+	for _, r := range v.Reasons {
+		if !limitReasons[r.Code] {
+			continue
+		}
+		if err := writeReason(w, r); err != nil {
+			return err
+		}
+	}
+	if len(v.TablesUnreadable) > 0 {
+		if err := fprintf(w, "  - unreadable tables: %s\n", strings.Join(v.TablesUnreadable, ", ")); err != nil {
+			return err
+		}
+	}
+	if v.ProcsRead > 0 {
+		if err := fprintf(w, "  - holder lookup walked %d process(es), %d not readable\n", v.ProcsRead, v.ProcsDenied); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func writeReason(w io.Writer, r verdict.Reason) error {
+	text, ok := reasonSentence[r.Code]
+	if !ok {
+		// An unregistered code is a bug in this file, not a reason to print
+		// nothing: the code itself is still the truth.
+		text = r.Code
+	}
+	if r.Detail != "" {
+		return fprintf(w, "  - %s (%s)\n", text, r.Detail)
+	}
+	return fprintf(w, "  - %s\n", text)
+}
+
+func ownerText(f verdict.Finding) string {
+	if len(f.Owners) == 0 {
+		if f.Socket.Inode == 0 {
+			return "no open descriptor"
+		}
+		return "owner not visible"
+	}
+	parts := make([]string, 0, len(f.Owners))
+	for _, o := range f.Owners {
+		if o.Comm != "" {
+			parts = append(parts, fmt.Sprintf("pid %d (%s) fd %d", o.PID, o.Comm, o.FD))
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("pid %d fd %d", o.PID, o.FD))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// JSON types are defined here, not on the domain types, so that the file format
+// is a decision someone made rather than a side effect of Go field names.
+type jsonReport struct {
+	Target   string        `json:"target"`
+	Proto    string        `json:"proto"`
+	Kind     string        `json:"kind"`
+	Findings []jsonFinding `json:"findings"`
+	Reasons  []jsonReason  `json:"reasons"`
+	Evidence jsonEvidence  `json:"evidence"`
+	Version  string        `json:"version"`
+}
+
+type jsonFinding struct {
+	State  string      `json:"state"`
+	Local  string      `json:"local"`
+	Remote string      `json:"remote,omitempty"`
+	Inode  uint64      `json:"inode"`
+	Table  string      `json:"table"`
+	Owners []jsonOwner `json:"owners"`
+}
+
+type jsonOwner struct {
+	PID  int    `json:"pid"`
+	Comm string `json:"comm,omitempty"`
+	FD   int    `json:"fd"`
+}
+
+type jsonReason struct {
+	Code   string `json:"code"`
+	Detail string `json:"detail,omitempty"`
+}
+
+type jsonEvidence struct {
+	TablesRead       int      `json:"tables_read"`
+	TablesUnreadable []string `json:"tables_unreadable"`
+	ProcsRead        int      `json:"procs_read"`
+	ProcsDenied      int      `json:"procs_denied"`
+}
+
+func renderJSON(w io.Writer, v verdict.Verdict) error {
+	rep := jsonReport{
+		Target:   v.Query.Addr.String(),
+		Proto:    v.Query.Proto.String(),
+		Kind:     string(v.Kind),
+		Findings: make([]jsonFinding, 0, len(v.Findings)),
+		Reasons:  make([]jsonReason, 0, len(v.Reasons)),
+		Evidence: jsonEvidence{
+			TablesRead:       v.TablesRead,
+			TablesUnreadable: v.TablesUnreadable,
+			ProcsRead:        v.ProcsRead,
+			ProcsDenied:      v.ProcsDenied,
+		},
+		Version: version.Resolve().Version,
+	}
+	if rep.Evidence.TablesUnreadable == nil {
+		rep.Evidence.TablesUnreadable = []string{}
+	}
+	for _, f := range v.Findings {
+		jf := jsonFinding{
+			State:  f.Socket.State.String(),
+			Local:  f.Socket.Local.String(),
+			Inode:  f.Socket.Inode,
+			Table:  f.Socket.Table,
+			Owners: make([]jsonOwner, 0, len(f.Owners)),
+		}
+		if f.Socket.Remote.Port != 0 {
+			jf.Remote = f.Socket.Remote.String()
+		}
+		for _, o := range f.Owners {
+			jf.Owners = append(jf.Owners, jsonOwner{PID: o.PID, Comm: o.Comm, FD: o.FD})
+		}
+		rep.Findings = append(rep.Findings, jf)
+	}
+	for _, r := range v.Reasons {
+		rep.Reasons = append(rep.Reasons, jsonReason{Code: r.Code, Detail: r.Detail})
+	}
+
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(rep); err != nil {
+		return fmt.Errorf("encode json: %w", err)
+	}
+	return nil
+}
+
+func usage(w io.Writer) error {
+	return fprintf(w, `portwhy — explain why a port cannot be bound
+
+usage
+  portwhy why <host:port> [flags]
+  portwhy version
+
+flags for "why"
+  -proto tcp|udp   protocol to check (default tcp)
+  -json            machine-readable report
+  -no-holders      skip the /proc/<pid>/fd walk
+  -tables DIR      kernel socket table directory (default %s)
+  -proc ROOT       procfs root used to name holders (default %s)
+
+exit codes
+  0  free: nothing readable occupies it
+  1  taken: a listener, a TIME_WAIT reservation or another socket holds it
+  2  usage or internal error
+  3  unknown: the evidence needed was missing — this is not "free"
+
+example
+  portwhy why 127.0.0.1:8080
+  portwhy why :53 -proto udp -json
+`, procnet.DefaultDir, sockid.DefaultRoot)
+}
+
+func fprintf(w io.Writer, format string, a ...any) error {
+	_, err := fmt.Fprintf(w, format, a...)
+	return err
+}
