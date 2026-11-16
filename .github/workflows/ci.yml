@@ -1,0 +1,80 @@
+name: ci
+
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: false
+      - name: Format
+        # The rule lives in the Makefile and nowhere else: a second copy here is
+        # a second definition of "formatted", and the two drift.
+        run: make fmt-check
+      - name: Vet
+        run: go vet ./...
+      - name: Test (no skips)
+        # Every test in this repository reads /proc, so on a non-Linux runner
+        # they would all skip and the job would be green about nothing.
+        run: make test-noskip
+      - name: Race
+        run: go test -count=1 -race ./...
+      - name: Zero dependencies
+        run: make deps-check
+      - name: Cross-compile
+        run: make build-check
+
+      - name: Exit-code contract
+        # The exit codes are the interface: a script branches on them. This step
+        # asserts the two that are easy to break silently — "taken" is 1, and
+        # "could not tell" is 3 and never 0.
+        run: |
+          make build
+          ./bin/portwhy version
+          python3 - <<'PY' &
+          import socket, time
+          s = socket.socket()
+          s.bind(("127.0.0.1", 45678))
+          s.listen(8)
+          time.sleep(30)
+          PY
+          sleep 1
+          set +e
+          ./bin/portwhy why 127.0.0.1:45678
+          taken=$?
+          set -e
+          echo "taken exit=$taken"
+          test "$taken" -eq 1
+
+          mkdir -p /tmp/broken
+          printf 'this is not a socket table\n' > /tmp/broken/tcp
+          set +e
+          ./bin/portwhy why 127.0.0.1:45679 -tables /tmp/broken -no-holders
+          unknown=$?
+          set -e
+          echo "unknown exit=$unknown"
+          test "$unknown" -eq 3
+
+      - name: JSON is machine-readable
+        run: |
+          ./bin/portwhy why :45679 -json -no-holders > /tmp/report.json || true
+          python3 -c "import json,sys; r=json.load(open('/tmp/report.json')); assert r['kind'] in ('free','listening','time-wait-only','occupied-non-listening','unknown'), r; assert r['evidence']['tables_unreadable'] is not None"
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache: false
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.12.2
