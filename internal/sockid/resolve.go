@@ -10,6 +10,7 @@
 package sockid
 
 import (
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -30,7 +31,13 @@ type Index struct {
 	// ByInode maps a socket inode to every descriptor pointing at it. More than
 	// one holder is normal: a forked worker inherits its parent's listener, and
 	// naming only the parent would send the user to kill the wrong process.
+	// Every bucket is sorted by pid, then descriptor.
 	ByInode map[uint64][]Holder
+
+	// PPID maps pid to its parent, as read during the same walk. It is the only
+	// evidence available about which of several holders had a socket first: the
+	// kernel records no creator, but a shared socket is inherited across fork().
+	PPID map[int]int
 
 	// ProcsRead is how many processes we looked inside.
 	ProcsRead int
@@ -45,13 +52,30 @@ type Index struct {
 // Complete reports whether every process on the machine was readable.
 func (i *Index) Complete() bool { return i != nil && i.ProcsDenied == 0 }
 
-// Holders returns the holders of one inode. Inode 0 (TIME_WAIT and friends) has
-// no file behind it, so no process can hold it.
+// Holders returns the holders of one inode, sorted by pid then descriptor. Inode
+// 0 (TIME_WAIT and friends) has no file behind it, so no process can hold it.
 func (i *Index) Holders(inode uint64) []Holder {
 	if i == nil || inode == 0 {
 		return nil
 	}
 	return i.ByInode[inode]
+}
+
+// sortHolders puts every bucket in a fixed order.
+//
+// ReadDir returns names sorted as strings, so pid 100 comes before pid 50 and a
+// fork/worker pair would be reported in an order that means nothing. Pid order is
+// what a reader uses to pick one, and a report that reshuffles between runs cannot
+// be diffed.
+func (i *Index) sortHolders() {
+	for _, hs := range i.ByInode {
+		sort.SliceStable(hs, func(a, b int) bool {
+			if hs[a].PID != hs[b].PID {
+				return hs[a].PID < hs[b].PID
+			}
+			return hs[a].FD < hs[b].FD
+		})
+	}
 }
 
 func (i *Index) add(inode uint64, h Holder) {

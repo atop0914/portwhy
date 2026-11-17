@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"net/netip"
 	"sort"
+	"strings"
 
 	"github.com/atop0914/portwhy/internal/procnet"
 )
@@ -54,6 +55,18 @@ const (
 	ReasonNoOwnerInode    = "no-inode-so-no-owner"
 	ReasonProcsDenied     = "some-processes-unreadable"
 	ReasonProbeNotRun     = "bind-not-probed"
+	// ReasonTeardown records rows that were seen on the address and discarded
+	// because the kernel had already released them. Silently dropping them
+	// would make the report disagree with the table a user is looking at.
+	ReasonTeardown = "row-being-destroyed"
+	// ReasonUnknownState is a state code this build does not know. It is a hole
+	// in the evidence, not a row to be counted as occupation.
+	ReasonUnknownState = "unknown-state-code"
+	// ReasonUnlistedBinding is a property of the data source, not of this run: a
+	// socket that was bound without listen() holds the port and has no row in
+	// /proc/net/tcp. It is stated on every "free" answer, the only answer it can
+	// invalidate.
+	ReasonUnlistedBinding = "bind-without-listen-not-listed"
 )
 
 // Owner is one process holding one socket, as this package needs to know it.
@@ -63,6 +76,10 @@ type Owner struct {
 	PID  int
 	Comm string
 	FD   int
+	// Role is what the process tree proves about how this process got the
+	// socket. It answers the question a user actually asks when several pids
+	// share one listener: which of these do I deal with.
+	Role Role
 }
 
 // Finding is one socket that occupies the queried address, with whoever holds it.
@@ -92,6 +109,12 @@ type Env struct {
 	// ProcsRead and ProcsDenied describe how complete the holder lookup was.
 	ProcsRead   int
 	ProcsDenied int
+	// PPID maps pid to parent pid and is the only evidence available about which
+	// of several holders had a socket first: the kernel records no creator, but a
+	// shared socket is inherited across fork(), so the holder that is an ancestor
+	// of the others must precede them. Nil is allowed — roles then stop at
+	// "sole" and "shared" instead of guessing.
+	PPID map[int]int
 }
 
 // Verdict is the answer plus the evidence it rests on.
@@ -100,6 +123,10 @@ type Verdict struct {
 	Kind     Kind
 	Findings []Finding
 	Reasons  []Reason
+	// All is every row that mentions the queried port, each labelled with why it
+	// did or did not take part. It is empty unless ExplainAll was used, and it is
+	// filled afterwards: no row in it can reach the judgement.
+	All []Row
 	// TablesRead and TablesUnreadable document the scope of the look, so a
 	// reader can tell "nothing holds it" from "nothing was readable".
 	TablesRead       int
@@ -149,6 +176,10 @@ func Explain(q Query, tables []procnet.Table, env Env) Verdict {
 		return v
 	}
 
+	// Rows the kernel has already released are collected separately: they match
+	// the address but they do not hold it, and calling them holders would tell a
+	// user to go kill a process that is already gone.
+	var released []procnet.Socket
 	for _, t := range relevant {
 		for _, s := range t.Sockets {
 			// The row carries its own protocol; checking it as well as the
@@ -160,9 +191,13 @@ func Explain(q Query, tables []procnet.Table, env Env) Verdict {
 			if !occupies(s, q) {
 				continue
 			}
+			if s.State.Binding() == procnet.EffectTeardown {
+				released = append(released, s)
+				continue
+			}
 			f := Finding{Socket: s}
 			if env.Lookup != nil {
-				f.Owners = env.Lookup(s)
+				f.Owners = prepareOwners(env.Lookup(s), env.PPID)
 			}
 			v.Findings = append(v.Findings, f)
 		}
@@ -182,7 +217,14 @@ func Explain(q Query, tables []procnet.Table, env Env) Verdict {
 		return a.State < b.State
 	})
 
-	v.Kind = classify(v.Findings)
+	var unrecognised []procnet.State
+	v.Kind, unrecognised = classify(v.Findings)
+	if len(unrecognised) > 0 {
+		v.Reasons = append(v.Reasons, Reason{
+			Code:   ReasonUnknownState,
+			Detail: stateLabels(unrecognised),
+		})
+	}
 
 	switch v.Kind {
 	case KindFree:
@@ -197,8 +239,14 @@ func Explain(q Query, tables []procnet.Table, env Env) Verdict {
 				Code:   ReasonV6Wildcard,
 				Detail: shadow.Local.String(),
 			})
-		} else {
+		} else if len(released) == 0 {
 			v.Reasons = append(v.Reasons, Reason{Code: ReasonNoSockets})
+		}
+		if v.Kind == KindFree {
+			// The one answer this blind spot can invalidate, so it is stated
+			// here and nowhere else: a caveat that appears on every report stops
+			// being read.
+			v.Reasons = append(v.Reasons, Reason{Code: ReasonUnlistedBinding})
 		}
 	case KindListening:
 		v.Reasons = append(v.Reasons, Reason{Code: ReasonListener})
@@ -206,6 +254,10 @@ func Explain(q Query, tables []procnet.Table, env Env) Verdict {
 		v.Reasons = append(v.Reasons, Reason{Code: ReasonTimeWait})
 	case KindOccupiedNonListening:
 		v.Reasons = append(v.Reasons, Reason{Code: ReasonOtherState})
+	}
+
+	if len(released) > 0 {
+		v.Reasons = append(v.Reasons, Reason{Code: ReasonTeardown, Detail: teardownDetail(released)})
 	}
 
 	// A TIME_WAIT row has inode 0, so no amount of /proc walking will name an
@@ -236,42 +288,100 @@ func Explain(q Query, tables []procnet.Table, env Env) Verdict {
 	return v
 }
 
-func classify(findings []Finding) Kind {
-	if len(findings) == 0 {
-		return KindFree
-	}
+// classify folds the findings into one kind, reading the consequence of each
+// row out of the state table instead of comparing states by hand.
+//
+// The precedence is the honesty of the answer. A listener explains an EADDRINUSE
+// outright and no other row can weaken that; an unrecognised state code is a hole
+// in the evidence and must not be folded into "occupied"; TIME_WAIT and nothing
+// else is its own diagnosis because its fix is different from a live socket's.
+func classify(findings []Finding) (Kind, []procnet.State) {
+	var (
+		unrecognised []procnet.State
+		listening    bool
+		occupied     bool
+		considered   int
+	)
 	onlyTimeWait := true
 	for _, f := range findings {
-		if f.Socket.State == procnet.StateListen {
-			return KindListening
+		switch effect := f.Socket.State.Binding(); effect {
+		case procnet.EffectTeardown:
+			// Explain drops these before classifying. Skipping here too means a
+			// released row can never be counted as occupation by any caller — and
+			// it is not counted as "something was here" either, so a report made
+			// only of released rows does not become "only TIME_WAIT".
+			continue
+		case procnet.EffectBlocks:
+			listening = true
+		case procnet.EffectOptionsDecide:
+			occupied = true
+		default:
+			unrecognised = append(unrecognised, f.Socket.State)
 		}
+		considered++
 		if f.Socket.State != procnet.StateTimeWait {
 			onlyTimeWait = false
 		}
 	}
-	if onlyTimeWait {
-		return KindTimeWaitOnly
+	switch {
+	case listening:
+		return KindListening, nil
+	case len(unrecognised) > 0:
+		return KindUnknown, unrecognised
+	case considered > 0 && onlyTimeWait:
+		return KindTimeWaitOnly, nil
+	case occupied:
+		return KindOccupiedNonListening, nil
 	}
-	return KindOccupiedNonListening
+	return KindFree, nil
+}
+
+// stateLabels renders state codes once each, in a stable order, so a reason's
+// detail is diffable between runs.
+func stateLabels(states []procnet.State) string {
+	seen := make(map[procnet.State]bool, len(states))
+	labels := make([]string, 0, len(states))
+	for _, s := range states {
+		if seen[s] {
+			continue
+		}
+		seen[s] = true
+		labels = append(labels, s.String())
+	}
+	sort.Strings(labels)
+	return strings.Join(labels, ", ")
+}
+
+// teardownDetail names what was seen and dropped, so a reader can find those rows
+// in the table themselves instead of wondering what the tool hid.
+func teardownDetail(released []procnet.Socket) string {
+	states := make([]procnet.State, 0, len(released))
+	for _, s := range released {
+		states = append(states, s.State)
+	}
+	return fmt.Sprintf("%d row(s) in %s: the kernel has already released the port",
+		len(released), stateLabels(states))
 }
 
 // occupies reports whether a socket row sits on the queried address.
-//
-// The rules are the ones bind() applies, not the ones a naive port comparison
-// applies: a wildcard on either side covers the other, and a specific address
-// only covers itself. Getting this wrong in the loose direction means reporting
-// a conflict that does not exist, and users stop believing the tool after one.
 func occupies(s procnet.Socket, q Query) bool {
-	if s.Local.Port != q.Addr.Port {
+	return s.Local.Port == q.Addr.Port && addressCovers(s.Local, q.Addr)
+}
+
+// addressCovers applies bind()'s rule for one address against another: a wildcard
+// on either side covers the other, a specific address covers only itself, and
+// different families never interact.
+//
+// Getting this wrong in the loose direction reports a conflict that does not
+// exist, and users stop believing the tool after one such report.
+func addressCovers(held, want procnet.Addr) bool {
+	if !sameFamily(held.IP, want.IP) {
 		return false
 	}
-	if !sameFamily(s.Local.IP, q.Addr.IP) {
-		return false
-	}
-	if s.Local.IsWildcard() || q.Addr.IsWildcard() {
+	if held.IsWildcard() || want.IsWildcard() {
 		return true
 	}
-	return s.Local.IP == q.Addr.IP
+	return held.IP == want.IP
 }
 
 func sameFamily(a, b netip.Addr) bool {

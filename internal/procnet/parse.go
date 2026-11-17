@@ -85,27 +85,8 @@ const (
 	StateNewSynRecv  State = 0x0C
 )
 
-var stateNames = map[State]string{
-	StateEstablished: "ESTABLISHED",
-	StateSynSent:     "SYN_SENT",
-	StateSynRecv:     "SYN_RECV",
-	StateFinWait1:    "FIN_WAIT1",
-	StateFinWait2:    "FIN_WAIT2",
-	StateTimeWait:    "TIME_WAIT",
-	StateClose:       "CLOSE",
-	StateCloseWait:   "CLOSE_WAIT",
-	StateLastAck:     "LAST_ACK",
-	StateListen:      "LISTEN",
-	StateClosing:     "CLOSING",
-	StateNewSynRecv:  "NEW_SYN_RECV",
-}
-
-func (s State) String() string {
-	if n, ok := stateNames[s]; ok {
-		return n
-	}
-	return fmt.Sprintf("UNKNOWN(0x%02x)", uint8(s))
-}
+// The names and the bind() consequences live in state.go: one table, so a state
+// cannot be named here and forgotten there.
 
 // Addr is one endpoint as the table spells it: an address and a port.
 type Addr struct {

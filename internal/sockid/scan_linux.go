@@ -3,6 +3,7 @@
 package sockid
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -22,7 +23,10 @@ func Scan(root string) (*Index, error) {
 		return nil, fmt.Errorf("sockid: read %s: %w", root, err)
 	}
 
-	idx := &Index{ByInode: make(map[uint64][]Holder)}
+	idx := &Index{
+		ByInode: make(map[uint64][]Holder),
+		PPID:    make(map[int]int),
+	}
 	for _, e := range entries {
 		pid, ok := parsePID(e.Name())
 		if !ok {
@@ -30,6 +34,7 @@ func Scan(root string) (*Index, error) {
 		}
 		idx.scanProc(root, pid)
 	}
+	idx.sortHolders()
 	return idx, nil
 }
 
@@ -50,6 +55,9 @@ func (i *Index) scanProc(root string, pid int) {
 	i.ProcsRead++
 
 	comm := readComm(root, pid)
+	if ppid, ok := readPPID(root, pid); ok {
+		i.PPID[pid] = ppid
+	}
 	for _, fd := range fds {
 		target, err := os.Readlink(filepath.Join(fdDir, fd.Name()))
 		if err != nil {
@@ -76,6 +84,33 @@ func readComm(root string, pid int) string {
 		return ""
 	}
 	return strings.TrimSpace(string(b))
+}
+
+// readPPID returns the parent pid from /proc/<pid>/stat.
+//
+// The second field is the command name in parentheses and may itself contain
+// spaces and parentheses ("(my app (v2))"), so the fields are counted from the
+// last ')' instead of being split from the start: splitting naively shifts every
+// field after the name and reports a pid that is not the parent.
+func readPPID(root string, pid int) (int, bool) {
+	b, err := os.ReadFile(filepath.Join(root, strconv.Itoa(pid), "stat"))
+	if err != nil {
+		return 0, false
+	}
+	end := bytes.LastIndexByte(b, ')')
+	if end < 0 {
+		return 0, false
+	}
+	// After the name: state, ppid, pgrp, ...
+	fields := strings.Fields(string(b[end+1:]))
+	if len(fields) < 2 {
+		return 0, false
+	}
+	ppid, err := strconv.Atoi(fields[1])
+	if err != nil || ppid < 0 {
+		return 0, false
+	}
+	return ppid, true
 }
 
 func parsePID(name string) (int, bool) {
