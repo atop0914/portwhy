@@ -34,6 +34,28 @@ every week.
 The `free` row carries the risk. It is the only kind that tells a user "go
 ahead", so every hole in the evidence must collapse it into `unknown` first.
 
+### The state table
+
+Each of the twelve TCP states carries three things: the kernel's own spelling, what
+it means for a later `bind()`, and one clause saying why. `portwhy states` prints
+it; `internal/procnet/state.go` is it. It is a table rather than a chain of
+comparisons because "what does this state do to my bind" is the question, and a
+table can be read against `man 7 tcp` in one pass.
+
+| effect | states | what a `bind()` does |
+|---|---|---|
+| `blocks` | `LISTEN` | fails with `EADDRINUSE`; `SO_REUSEPORT` can share the port, but only between sockets that both asked for it |
+| `options-decide` | the other ten bound states | the port is held; whether the bind fails depends on `SO_REUSEADDR` and on whether the holder set it too |
+| `teardown` | `CLOSE` | already released by the kernel: it does not explain an `EADDRINUSE` now |
+| `unknown` | any code this build does not know | nothing can be claimed, so the answer becomes `unknown` |
+
+Two consequences are deliberate. An unrecognised state code degrades the whole
+answer to `unknown` instead of being counted as occupation: a state the tool cannot
+describe is a hole in the evidence, and `UNKNOWN(0x..)` in the output is the tool
+saying so. And `CLOSE` is not a holder — the row is disclosed in the reasons and
+left out of the holders list, because naming a process for a socket the kernel has
+released sends the reader off to kill something that is already gone.
+
 ## 3. Capability boundary
 
 ### What the data sources can prove
@@ -47,6 +69,13 @@ ahead", so every hole in the evidence must collapse it into `unknown` first.
   many processes we were not allowed to look inside. Proven by test: the inode of
   a real listener is attributed back to the test process, and a closed socket
   stops being attributed (`internal/sockid/scan_linux_test.go`).
+- The `bind()` consequence of every state, from one table that is asserted against
+  the kernel's own twelve state codes rather than sampled
+  (`internal/procnet/state_test.go`).
+- Which of several holders had a shared socket first, as far as the process tree
+  can say: a shared socket arrives through `fork()`, so a holder that is an
+  ancestor of the others must precede them. Proven with a real forked child
+  (`internal/sockid/scan_linux_test.go`, `cmd/portwhy/main_rows_linux_test.go`).
 
 ### What they cannot prove
 
@@ -66,6 +95,16 @@ ahead", so every hole in the evidence must collapse it into `unknown` first.
 - **Whether the holder is the one you care about.** A forked worker inherits its
   parent's listener; both are reported, and choosing between them is the user's
   job.
+- **A socket that was bound and never listened.** It holds the port — a second
+  `bind()` fails with `EADDRINUSE` — and it has no row in any `/proc/net` table,
+  because those tables iterate only the connection and listener hashes. This is
+  measured, not assumed (`cmd/portwhy/live_linux_test.go`), and it is why every
+  `free` answer carries the `bind-without-listen-not-listed` caveat. Only a probe
+  can close it.
+- **Who opened a shared socket when the descriptor was passed.** A role is derived
+  from the process tree, which proves descent and nothing else. When several
+  holders are unrelated (systemd socket activation hands the listener to a service
+  that is not its child), the report says `shared` and stops there.
 
 ### Deliberately not done
 
@@ -108,6 +147,17 @@ Each of these is a test today, and each is a way the tool could become harmful:
 - A `[::]` listener on the port must produce `unknown`, never `free`.
 - An IPv4-mapped target (`[::ffff:127.0.0.1]:8080`) must be compared as IPv4,
   or the answer is `free` for a port that is plainly taken.
+- An unrecognised state code must produce `unknown`, never `occupied` and never
+  `free`: the tool cannot describe the row, so it cannot judge it.
+- A row the kernel has already released must be disclosed and must not appear in
+  the holders list. Naming a process there is an accusation against a socket that
+  no longer exists.
+- `--all` must not change the kind or the exit code. It is compared byte for byte
+  on the `kind` field, over a matrix of neighbour shapes
+  (`cmd/portwhy/main_rows_linux_test.go`).
+- A `free` answer without the `bind-without-listen-not-listed` caveat is a
+  regression: that is the one blind spot the tables have, and the one answer it can
+  invalidate.
 
 ## 6. What changes later
 
@@ -115,7 +165,8 @@ The probe (a later capability) will `bind()` four ways — plain, `SO_REUSEADDR`
 `SO_REUSEPORT`, and IPv6-only — and report what the kernel actually did. That
 turns three current uncertainties into facts: whether a `TIME_WAIT` row blocks
 this program, whether `[::]` shadows IPv4 here, and which errno the bind really
-returns.
+returns. It also closes the blind spot the tables have by construction: a port that
+looks free but is held by a socket that was bound without `listen()`.
 
 Two rules for that work, decided now so they are not decided under pressure:
 

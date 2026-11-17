@@ -9,7 +9,7 @@ $ portwhy why 127.0.0.1:8080
 127.0.0.1:8080/tcp — a listening socket holds it
 
 holders
-  LISTEN         127.0.0.1:8080         pid 892 (python3) fd 3       inode 29866188
+  LISTEN         127.0.0.1:8080         pid 892 (python3) fd 3 [sole] inode 29866188
 
 why
   - bind() to an address a listener holds fails with EADDRINUSE
@@ -18,6 +18,16 @@ limits
   - no bind was attempted: this verdict comes from kernel state only
   - holder lookup walked 3 process(es), 0 not readable
 ```
+
+When a listener is shared, every holder is listed with what the process tree proves
+about it: `creator` (it was there first — talk to this one), `inherited` (it was
+forked with the descriptor open — killing it leaves the port taken), or `shared`
+(the descriptor was passed, so /proc cannot say who opened it).
+
+`--all` lists every row that mentions the port, each with a machine-readable reason
+it did or did not take part (`matched`, `released`, `other-port`, `other-proto`,
+`other-family`, `other-address`, `wildcard-shadowed`). It changes nothing else: the
+verdict and the exit code are computed before a single row is added.
 
 ## Why another one
 
@@ -60,6 +70,7 @@ Zero third-party dependencies, no cgo. Linux only: the whole answer comes from
 
 ```
 portwhy why <host:port> [flags]
+portwhy states
 portwhy version
 ```
 
@@ -67,11 +78,15 @@ portwhy version
 |---|---|
 | `-proto tcp\|udp` | which protocol to check (default `tcp`) |
 | `-json` | machine-readable report on stdout |
+| `-all` | also list every row that mentions the port, with why it did or did not take part (the verdict does not change) |
 | `-no-holders` | skip the `/proc/<pid>/fd` walk: kernel state only |
 | `-tables DIR` | read the socket tables from DIR instead of `/proc/net` |
 | `-proc ROOT` | use ROOT instead of `/proc` when naming the holder |
 
 `:8080` means every interface (`0.0.0.0:8080`). `[::1]:8080` is IPv6.
+
+`portwhy states` prints the twelve TCP states with what each one does to a
+`bind()`, so the rule behind a verdict can be read instead of inferred.
 
 ### Exit codes
 
@@ -103,7 +118,13 @@ Written down because the boundary is the product:
   expose the age of a socket, so any "12 seconds left" would be invented.
 - **It does not name the holder of a `TIME_WAIT` row.** Those rows carry inode 0
   — there is no file descriptor behind them, so there is no process to name.
-  The report says exactly that instead of showing an empty owner column.
+  The report says exactly that instead of showing an empty owner column. The same
+  holds for a socket you closed that is still waiting out its timeout.
+- **It cannot see a socket that was bound without `listen()`.** That socket holds
+  the port (a second `bind()` fails with `EADDRINUSE`) and appears in no
+  `/proc/net` table, because those tables only iterate the connection and listener
+  hashes. So a `free` answer always carries that caveat, and it is the reason a
+  bind probe is the next capability rather than a nice-to-have.
 - **It does not kill anything.** No `--force`, no `--kill`, on purpose: a port
   diagnostic is the wrong place to hide a destructive action.
 - **It does not run on macOS or Windows.** `portwhy` exits with an explicit
