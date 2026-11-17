@@ -20,7 +20,8 @@ const (
 	// released it, so it was shown and not counted.
 	MatchReleased MatchCode = "released"
 
-	// MatchOtherPort means a different port.
+	// MatchOtherPort means the port appears only as the row's remote end: a
+	// connection *to* the port from somewhere else.
 	MatchOtherPort MatchCode = "other-port"
 	// MatchOtherProto means the same port number in the other transport: a UDP
 	// row never blocks a TCP bind.
@@ -54,12 +55,19 @@ type Row struct {
 // the neighbours of an answer must never move the answer.
 func ExplainAll(q Query, tables []procnet.Table, env Env) Verdict {
 	v := Explain(q, tables, env)
+	// Allocated up front so "asked for every row and there were none" stays
+	// distinguishable from "did not ask": a nil slice here means the caller used
+	// Explain, and the JSON report relies on that difference.
+	v.All = make([]Row, 0, 4)
 
 	for _, t := range tables {
 		for _, s := range t.Sockets {
-			// Matched by port only: that is what makes neighbours visible in the
-			// first place. Everything else is the code's job to explain.
-			if s.Local.Port != q.Addr.Port {
+			// "Mentions the port" is the filter: a row whose local end is the
+			// port, or one connected *to* it. The second half is why other-port
+			// exists — those rows are the far end of connections this tool
+			// otherwise only sees from one side, and they are how a reader
+			// explains a wall of TIME_WAIT rows.
+			if s.Local.Port != q.Addr.Port && s.Remote.Port != q.Addr.Port {
 				continue
 			}
 			row := Row{Socket: s, Match: matchCode(s, q)}

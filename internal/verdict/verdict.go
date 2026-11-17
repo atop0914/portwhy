@@ -260,10 +260,12 @@ func Explain(q Query, tables []procnet.Table, env Env) Verdict {
 		v.Reasons = append(v.Reasons, Reason{Code: ReasonTeardown, Detail: teardownDetail(released)})
 	}
 
-	// A TIME_WAIT row has inode 0, so no amount of /proc walking will name an
-	// owner. Saying that out loud stops the next question ("which process?").
+	// A row with inode 0 has no file descriptor behind it — a TIME_WAIT row, or a
+	// socket we closed that is still waiting out its timeout — so no amount of
+	// /proc walking will name an owner. Saying that out loud stops the next
+	// question ("which process?").
 	for _, f := range v.Findings {
-		if f.Socket.State == procnet.StateTimeWait {
+		if f.Socket.Inode == 0 {
 			v.Reasons = append(v.Reasons, Reason{Code: ReasonNoOwnerInode})
 			break
 		}

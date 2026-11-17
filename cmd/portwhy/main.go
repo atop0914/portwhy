@@ -43,6 +43,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	switch args[0] {
 	case "why":
 		return runWhy(args[1:], stdout, stderr)
+	case "states":
+		return runStates(args[1:], stdout, stderr)
 	case "version", "--version":
 		return runVersion(stdout, stderr)
 	case "help", "-h", "--help":
@@ -53,6 +55,43 @@ func run(args []string, stdout, stderr io.Writer) int {
 		_ = usage(stderr)
 		return exitUsage
 	}
+}
+
+// runStates prints the state vocabulary: every TCP state the kernel can report,
+// with what it does to a bind().
+//
+// It is a command rather than documentation because the table is the product.
+// Anyone who disagrees with a judgement can read the rule that produced it
+// instead of inferring it from one output.
+func runStates(args []string, stdout, stderr io.Writer) int {
+	if len(args) > 0 {
+		_ = fprintf(stderr, "portwhy: states takes no arguments\n\n")
+		_ = usage(stderr)
+		return exitUsage
+	}
+	if err := fprintf(stdout, "TCP states, as the kernel spells them in /proc/net/tcp st\n\n"); err != nil {
+		_ = fprintf(stderr, "portwhy: %v\n", err)
+		return exitUsage
+	}
+	if err := fprintf(stdout, "  %-6s %-14s %-15s %s\n", "code", "name", "bind effect", "what it means"); err != nil {
+		_ = fprintf(stderr, "portwhy: %v\n", err)
+		return exitUsage
+	}
+	for _, s := range procnet.KnownStates() {
+		if err := fprintf(stdout, "  0x%02x   %-14s %-15s %s\n",
+			uint8(s), s.String(), s.Binding(), s.Note()); err != nil {
+			_ = fprintf(stderr, "portwhy: %v\n", err)
+			return exitUsage
+		}
+	}
+	if err := fprintf(stdout,
+		"\n  codes this build does not know are printed as UNKNOWN(0x..) and force\n"+
+			"  the answer to \"unknown\": an unrecognised state is a hole in the evidence,\n"+
+			"  not a row to be counted as occupation.\n"); err != nil {
+		_ = fprintf(stderr, "portwhy: %v\n", err)
+		return exitUsage
+	}
+	return exitFree
 }
 
 func runVersion(stdout, stderr io.Writer) int {
@@ -71,6 +110,7 @@ func runWhy(args []string, stdout, stderr io.Writer) int {
 	tableDir := fs.String("tables", procnet.DefaultDir, "directory holding the kernel socket tables")
 	procRoot := fs.String("proc", sockid.DefaultRoot, "procfs root used to name the holder")
 	skipHolders := fs.Bool("no-holders", false, "do not walk /proc/<pid>/fd: kernel state only")
+	showAll := fs.Bool("all", false, "also list every row on this port, with why it did or did not take part")
 
 	if err := fs.Parse(splitFlags(fs, args)); err != nil {
 		return exitUsage
@@ -107,10 +147,19 @@ func runWhy(args []string, stdout, stderr io.Writer) int {
 			}
 			env.ProcsRead = idx.ProcsRead
 			env.ProcsDenied = idx.ProcsDenied
+			env.PPID = idx.PPID
 		}
 	}
 
-	v := verdict.Explain(q, tables, env)
+	// --all adds rows; it never re-decides. ExplainAll calls Explain and then
+	// attaches the neighbours, so the kind and the exit code cannot depend on the
+	// flag — that is a property of the code, not a promise in the help text.
+	var v verdict.Verdict
+	if *showAll {
+		v = verdict.ExplainAll(q, tables, env)
+	} else {
+		v = verdict.Explain(q, tables, env)
+	}
 
 	if *asJSON {
 		err = renderJSON(stdout, v)
@@ -236,19 +285,23 @@ var reasonSentence = map[string]string{
 	verdict.ReasonOtherState:      "a bound socket in a non-listening state holds this address; whether bind() fails depends on socket options",
 	verdict.ReasonTableUnreadable: "a socket table could not be read, so absence of a row proves nothing",
 	verdict.ReasonV6Wildcard:      "an IPv6 wildcard listener may also occupy IPv4, depending on net.ipv6.bindv6only",
-	verdict.ReasonNoOwnerInode:    "TIME_WAIT rows carry inode 0, so no process can be named for them",
+	verdict.ReasonNoOwnerInode:    "a row with inode 0 has no descriptor behind it (TIME_WAIT, or a socket closed and waiting out its timeout), so no process can be named for it",
 	verdict.ReasonProcsDenied:     "some processes could not be read, so an unnamed holder may exist",
 	verdict.ReasonProbeNotRun:     "no bind was attempted: this verdict comes from kernel state only",
+	verdict.ReasonTeardown:        "rows on this address belong to sockets the kernel is already destroying, so they do not hold the port",
+	verdict.ReasonUnknownState:    "a row used a state code this build does not know, so what it does to a bind cannot be stated",
+	verdict.ReasonUnlistedBinding: "a socket bound without listen() holds the port and has no row in these tables, so this answer cannot rule that out",
 }
 
 // limitReasons are the ones that describe what the answer does not cover. They
 // are printed in their own section so the caveat is not lost in the middle of
 // the diagnosis.
 var limitReasons = map[string]bool{
-	verdict.ReasonProbeNotRun:  true,
-	verdict.ReasonProcsDenied:  true,
-	verdict.ReasonNoOwnerInode: true,
-	verdict.ReasonV6Wildcard:   true,
+	verdict.ReasonProbeNotRun:     true,
+	verdict.ReasonProcsDenied:     true,
+	verdict.ReasonNoOwnerInode:    true,
+	verdict.ReasonV6Wildcard:      true,
+	verdict.ReasonUnlistedBinding: true,
 }
 
 func renderText(w io.Writer, v verdict.Verdict) error {
@@ -262,9 +315,15 @@ func renderText(w io.Writer, v verdict.Verdict) error {
 		}
 		for _, f := range v.Findings {
 			if err := fprintf(w, "  %-14s %-22s %-28s inode %d\n",
-				f.Socket.State, f.Socket.Local.String(), ownerText(f), f.Socket.Inode); err != nil {
+				f.Socket.State, f.Socket.Local.String(), ownerText(f.Owners, f.Socket.Inode), f.Socket.Inode); err != nil {
 				return err
 			}
+		}
+	}
+
+	if v.All != nil {
+		if err := renderRows(w, v.All); err != nil {
+			return err
 		}
 	}
 
@@ -324,20 +383,54 @@ func writeReason(w io.Writer, r verdict.Reason) error {
 	return fprintf(w, "  - %s\n", text)
 }
 
-func ownerText(f verdict.Finding) string {
-	if len(f.Owners) == 0 {
-		if f.Socket.Inode == 0 {
+// renderRows prints every row on the port, the ones that took part first.
+//
+// The reason is printed as the code it is; the legend underneath saves the reader
+// from having to memorise seven words without turning the column into prose that
+// cannot be grepped.
+func renderRows(w io.Writer, rows []verdict.Row) error {
+	if err := fprintf(w, "\nall rows on this port (--all)\n"); err != nil {
+		return err
+	}
+	if len(rows) == 0 {
+		return fprintf(w, "  - no row in the read tables mentions this port number\n")
+	}
+	for _, r := range rows {
+		remote := "-"
+		if r.Socket.Remote.Port != 0 {
+			remote = r.Socket.Remote.String()
+		}
+		if err := fprintf(w, "  %-18s %-14s %-22s %-22s inode %d  %s\n",
+			r.Match, r.Socket.State, r.Socket.Local.String(), remote, r.Socket.Inode,
+			ownerText(r.Owners, r.Socket.Inode)); err != nil {
+			return err
+		}
+	}
+	return fprintf(w, "  reasons: matched / released / other-port / other-proto / other-family / "+
+		"other-address / wildcard-shadowed\n")
+}
+
+func ownerText(owners []verdict.Owner, inode uint64) string {
+	if len(owners) == 0 {
+		if inode == 0 {
 			return "no open descriptor"
 		}
 		return "owner not visible"
 	}
-	parts := make([]string, 0, len(f.Owners))
-	for _, o := range f.Owners {
+	parts := make([]string, 0, len(owners))
+	for _, o := range owners {
+		label := fmt.Sprintf("pid %d", o.PID)
 		if o.Comm != "" {
-			parts = append(parts, fmt.Sprintf("pid %d (%s) fd %d", o.PID, o.Comm, o.FD))
-			continue
+			label = fmt.Sprintf("pid %d (%s)", o.PID, o.Comm)
 		}
-		parts = append(parts, fmt.Sprintf("pid %d fd %d", o.PID, o.FD))
+		// The role is what tells a user which of several pids to deal with:
+		// killing an inherited holder leaves the socket up on the creator.
+		if o.Role != "" {
+			label += fmt.Sprintf(" fd %d [%s]", o.FD, o.Role)
+		} else {
+			label += fmt.Sprintf(" fd %d", o.FD)
+		}
+		parts = append(parts, label)
 	}
 	return strings.Join(parts, ", ")
 }
@@ -352,10 +445,27 @@ type jsonReport struct {
 	Reasons  []jsonReason  `json:"reasons"`
 	Evidence jsonEvidence  `json:"evidence"`
 	Version  string        `json:"version"`
+	// Rows is present only with --all, and present even when it is empty: a
+	// consumer must be able to tell "asked, found none" from "did not ask".
+	Rows *[]jsonRow `json:"rows,omitempty"`
 }
 
 type jsonFinding struct {
 	State  string      `json:"state"`
+	Effect string      `json:"effect"`
+	Local  string      `json:"local"`
+	Remote string      `json:"remote,omitempty"`
+	Inode  uint64      `json:"inode"`
+	Table  string      `json:"table"`
+	Owners []jsonOwner `json:"owners"`
+}
+
+// jsonRow is one line of the --all listing: the row, and why it did or did not
+// take part.
+type jsonRow struct {
+	Match  string      `json:"match"`
+	State  string      `json:"state"`
+	Effect string      `json:"effect"`
 	Local  string      `json:"local"`
 	Remote string      `json:"remote,omitempty"`
 	Inode  uint64      `json:"inode"`
@@ -367,6 +477,15 @@ type jsonOwner struct {
 	PID  int    `json:"pid"`
 	Comm string `json:"comm,omitempty"`
 	FD   int    `json:"fd"`
+	Role string `json:"role,omitempty"`
+}
+
+func jsonOwners(owners []verdict.Owner) []jsonOwner {
+	out := make([]jsonOwner, 0, len(owners))
+	for _, o := range owners {
+		out = append(out, jsonOwner{PID: o.PID, Comm: o.Comm, FD: o.FD, Role: o.Role.String()})
+	}
+	return out
 }
 
 type jsonReason struct {
@@ -402,18 +521,35 @@ func renderJSON(w io.Writer, v verdict.Verdict) error {
 	for _, f := range v.Findings {
 		jf := jsonFinding{
 			State:  f.Socket.State.String(),
+			Effect: f.Socket.State.Binding().String(),
 			Local:  f.Socket.Local.String(),
 			Inode:  f.Socket.Inode,
 			Table:  f.Socket.Table,
-			Owners: make([]jsonOwner, 0, len(f.Owners)),
+			Owners: jsonOwners(f.Owners),
 		}
 		if f.Socket.Remote.Port != 0 {
 			jf.Remote = f.Socket.Remote.String()
 		}
-		for _, o := range f.Owners {
-			jf.Owners = append(jf.Owners, jsonOwner{PID: o.PID, Comm: o.Comm, FD: o.FD})
-		}
 		rep.Findings = append(rep.Findings, jf)
+	}
+	if v.All != nil {
+		rows := make([]jsonRow, 0, len(v.All))
+		for _, r := range v.All {
+			jr := jsonRow{
+				Match:  string(r.Match),
+				State:  r.Socket.State.String(),
+				Effect: r.Socket.State.Binding().String(),
+				Local:  r.Socket.Local.String(),
+				Inode:  r.Socket.Inode,
+				Table:  r.Socket.Table,
+				Owners: jsonOwners(r.Owners),
+			}
+			if r.Socket.Remote.Port != 0 {
+				jr.Remote = r.Socket.Remote.String()
+			}
+			rows = append(rows, jr)
+		}
+		rep.Rows = &rows
 	}
 	for _, r := range v.Reasons {
 		rep.Reasons = append(rep.Reasons, jsonReason{Code: r.Code, Detail: r.Detail})
@@ -432,11 +568,14 @@ func usage(w io.Writer) error {
 
 usage
   portwhy why <host:port> [flags]
+  portwhy states
   portwhy version
 
 flags for "why"
   -proto tcp|udp   protocol to check (default tcp)
   -json            machine-readable report
+  -all             also list every row on this port, with why it did or did not
+                   take part in the judgement (the judgement does not change)
   -no-holders      skip the /proc/<pid>/fd walk
   -tables DIR      kernel socket table directory (default %s)
   -proc ROOT       procfs root used to name holders (default %s)
@@ -450,6 +589,8 @@ exit codes
 example
   portwhy why 127.0.0.1:8080
   portwhy why :53 -proto udp -json
+  portwhy why :8080 -all
+  portwhy states
 `, procnet.DefaultDir, sockid.DefaultRoot)
 }
 
