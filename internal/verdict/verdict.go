@@ -459,10 +459,8 @@ func probeRefused(v Verdict, plain, reuse *probe.Attempt) Verdict {
 		// The whole reason this package exists. No table row covers the address,
 		// and the kernel still says someone holds it.
 		v.Kind = KindUnknown
-		// The blind spot has just been confirmed rather than closed, so it stops
-		// being a "limits" line: it is the diagnosis now, and saying both would
-		// read as two separate problems.
-		v.dropReason(ReasonUnlistedBinding)
+		// The caveat this collapse outlaws is removed by applyProbe, where the
+		// rule lives once: it belongs to a free answer and to no other.
 		v.Reasons = append(v.Reasons, Reason{
 			Code:   ReasonProbeHolds,
 			Detail: fmt.Sprintf("a plain bind returned %s at %s", plain.Errno, at),
