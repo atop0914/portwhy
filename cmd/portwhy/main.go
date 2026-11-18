@@ -15,7 +15,9 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/atop0914/portwhy/internal/probe"
 	"github.com/atop0914/portwhy/internal/procnet"
 	"github.com/atop0914/portwhy/internal/sockid"
 	"github.com/atop0914/portwhy/internal/verdict"
@@ -111,6 +113,7 @@ func runWhy(args []string, stdout, stderr io.Writer) int {
 	procRoot := fs.String("proc", sockid.DefaultRoot, "procfs root used to name the holder")
 	skipHolders := fs.Bool("no-holders", false, "do not walk /proc/<pid>/fd: kernel state only")
 	showAll := fs.Bool("all", false, "also list every row on this port, with why it did or did not take part")
+	useProbe := fs.Bool("probe", false, "attempt a real bind() (plain and SO_REUSEADDR, never listen())")
 
 	if err := fs.Parse(splitFlags(fs, args)); err != nil {
 		return exitUsage
@@ -124,6 +127,16 @@ func runWhy(args []string, stdout, stderr io.Writer) int {
 	q, err := parseQuery(fs.Arg(0), *proto)
 	if err != nil {
 		_ = fprintf(stderr, "portwhy: %v\n", err)
+		return exitUsage
+	}
+
+	// The probe answers the TCP question — "does bind() on this stream socket
+	// fail". A UDP probe would be a different experiment (no listener concept, no
+	// TIME_WAIT), so offering one today would mean reporting the result of one
+	// experiment as the answer to the other.
+	if *useProbe && q.Proto != procnet.TCP {
+		_ = fprintf(stderr, "portwhy: -probe is tcp only; a udp probe would answer a different question, "+
+			"so this version does not pretend to make one\n")
 		return exitUsage
 	}
 
@@ -149,6 +162,13 @@ func runWhy(args []string, stdout, stderr io.Writer) int {
 			env.ProcsDenied = idx.ProcsDenied
 			env.PPID = idx.PPID
 		}
+	}
+
+	// Tables first, probe second. The order is not an implementation detail: it
+	// is what lets the report say "the tables showed X, and a bind at time T
+	// said Y" without a reader having to guess which observation is newer.
+	if *useProbe {
+		env.Probe = probe.Both(netip.AddrPortFrom(q.Addr.IP, q.Addr.Port))
 	}
 
 	// --all adds rows; it never re-decides. ExplainAll calls Explain and then
@@ -291,6 +311,13 @@ var reasonSentence = map[string]string{
 	verdict.ReasonTeardown:        "rows on this address belong to sockets the kernel is already destroying, so they do not hold the port",
 	verdict.ReasonUnknownState:    "a row used a state code this build does not know, so what it does to a bind cannot be stated",
 	verdict.ReasonUnlistedBinding: "a socket bound without listen() holds the port and has no row in these tables, so this answer cannot rule that out",
+	verdict.ReasonProbeBound:      "a plain bind succeeded, so the tables' silence was accurate at that instant and nothing — including a socket bound without listen() — held the address",
+	verdict.ReasonProbeRefused:    "a plain bind was refused, which is what the rows above predict",
+	verdict.ReasonProbeHolds:      "a plain bind was refused while no row covers the address: something bound this port without listen(), and no table lists it",
+	verdict.ReasonProbeOption:     "a plain bind is refused but SO_REUSEADDR succeeds: the reservation belongs to a closed connection, not to a running process",
+	verdict.ReasonProbeDenied:     "the bind probe could not be made, so nothing was learned about the address — this is not a free port",
+	verdict.ReasonProbeGap:        "the probe evidence lacks the plain attempt that any conclusion about binding needs",
+	verdict.ReasonProbeConflict:   "the tables and the probe describe different instants, and this version cannot say which one you are facing",
 }
 
 // limitReasons are the ones that describe what the answer does not cover. They
@@ -298,6 +325,8 @@ var reasonSentence = map[string]string{
 // the diagnosis.
 var limitReasons = map[string]bool{
 	verdict.ReasonProbeNotRun:     true,
+	verdict.ReasonProbeDenied:     true,
+	verdict.ReasonProbeGap:        true,
 	verdict.ReasonProcsDenied:     true,
 	verdict.ReasonNoOwnerInode:    true,
 	verdict.ReasonV6Wildcard:      true,
@@ -346,6 +375,13 @@ func renderText(w io.Writer, v verdict.Verdict) error {
 		}
 	}
 
+	// The probe goes between the diagnosis and the limits: it is what was done,
+	// not what could not be seen, and reading "why" straight into the raw
+	// attempts is the order the question is asked in.
+	if err := renderProbe(w, v.Probe); err != nil {
+		return err
+	}
+
 	if err := fprintf(w, "\nlimits\n"); err != nil {
 		return err
 	}
@@ -381,6 +417,68 @@ func writeReason(w io.Writer, r verdict.Reason) error {
 		return fprintf(w, "  - %s (%s)\n", text, r.Detail)
 	}
 	return fprintf(w, "  - %s\n", text)
+}
+
+// renderProbe prints what was actually attempted, and when.
+//
+// The word "guarantee" does not appear because the answer cannot be one: a bind
+// that succeeded at 12:00:00.100 says nothing about 12:00:00.900. Printing the
+// instant is what makes that limitation checkable instead of rhetorical.
+func renderProbe(w io.Writer, attempts []probe.Attempt) error {
+	if len(attempts) == 0 {
+		return nil
+	}
+	if err := fprintf(w, "\nprobe\n"); err != nil {
+		return err
+	}
+	for _, a := range attempts {
+		if err := fprintf(w, "  %-10s at %s  %s\n",
+			string(a.Mode), a.At.Format(time.RFC3339), probeOutcomeText(a)); err != nil {
+			return err
+		}
+	}
+	return fprintf(w, "  what these attempts found at those instants only; anyone may take or release\n"+
+		"  the port afterwards, so none of it is a promise. listen() was never called and\n"+
+		"  every socket was closed immediately.\n")
+}
+
+// probeOutcomeText renders one attempt, errno included: "it failed" without the
+// errno sends the reader looking for a different problem than the one found.
+func probeOutcomeText(a probe.Attempt) string {
+	var text string
+	switch a.Outcome {
+	case probe.OutcomeBound:
+		text = "bind succeeded, socket closed immediately"
+	case probe.OutcomeAddrInUse:
+		text = namedErrno(a, "EADDRINUSE", "address already in use")
+	case probe.OutcomeNotPermitted:
+		text = namedErrno(a, "EACCES", "permission denied") + " — refused before the address was considered"
+	case probe.OutcomeAddrNotAvailable:
+		text = namedErrno(a, "EADDRNOTAVAIL", "cannot assign requested address") + " — not an address of this host"
+	case probe.OutcomeFailed:
+		text = namedErrno(a, "?", "") + " — an errno this build does not classify"
+	case probe.OutcomeNotRun:
+		text = "no bind was attempted"
+	}
+	if a.Err != "" {
+		text += "; not usable as evidence: " + a.Err
+	}
+	return text
+}
+
+func namedErrno(a probe.Attempt, fallbackName, fallbackMessage string) string {
+	name := a.Errno
+	if name == "" {
+		name = fallbackName
+	}
+	msg := a.Message
+	if msg == "" {
+		msg = fallbackMessage
+	}
+	if msg == "" || msg == name {
+		return name
+	}
+	return fmt.Sprintf("%s (%s)", name, msg)
 }
 
 // renderRows prints every row on the port, the ones that took part first.
@@ -448,6 +546,29 @@ type jsonReport struct {
 	// Rows is present only with --all, and present even when it is empty: a
 	// consumer must be able to tell "asked, found none" from "did not ask".
 	Rows *[]jsonRow `json:"rows,omitempty"`
+	// Probe is present only with --probe, for the same reason: absence means the
+	// experiment was not run, and no zero value stands in for it.
+	Probe *jsonProbe `json:"probe,omitempty"`
+}
+
+// jsonProbe carries the attempts and the sentence that keeps them from being
+// mistaken for a promise. There is no field for a guarantee, deliberately.
+type jsonProbe struct {
+	Attempts []jsonAttempt `json:"attempts"`
+	Note     string        `json:"note"`
+}
+
+type jsonAttempt struct {
+	Mode    string `json:"mode"`
+	At      string `json:"at"`
+	Outcome string `json:"outcome"`
+	Errno   string `json:"errno,omitempty"`
+	Message string `json:"message,omitempty"`
+	// Error is set when the attempt itself is not trustworthy (socket() refused,
+	// close() failed); a consumer that ignores it would read a broken attempt as
+	// a result.
+	Error            string `json:"error,omitempty"`
+	UsableAsEvidence bool   `json:"usable_as_evidence"`
 }
 
 type jsonFinding struct {
@@ -551,6 +672,25 @@ func renderJSON(w io.Writer, v verdict.Verdict) error {
 		}
 		rep.Rows = &rows
 	}
+	if len(v.Probe) > 0 {
+		jp := jsonProbe{
+			Attempts: make([]jsonAttempt, 0, len(v.Probe)),
+			Note: "one bind() per attempt at the time shown, listen() never called, socket closed " +
+				"immediately; the port may be taken or released afterwards",
+		}
+		for _, a := range v.Probe {
+			jp.Attempts = append(jp.Attempts, jsonAttempt{
+				Mode:             string(a.Mode),
+				At:               a.At.Format(time.RFC3339),
+				Outcome:          string(a.Outcome),
+				Errno:            a.Errno,
+				Message:          a.Message,
+				Error:            a.Err,
+				UsableAsEvidence: a.Trustworthy(),
+			})
+		}
+		rep.Probe = &jp
+	}
 	for _, r := range v.Reasons {
 		rep.Reasons = append(rep.Reasons, jsonReason{Code: r.Code, Detail: r.Detail})
 	}
@@ -576,6 +716,10 @@ flags for "why"
   -json            machine-readable report
   -all             also list every row on this port, with why it did or did not
                    take part in the judgement (the judgement does not change)
+  -probe           attempt a real bind() and report what the kernel answered:
+                   one plain attempt and one with SO_REUSEADDR, never listen().
+                   tcp only. Exit code may become 3 where the tables had said
+                   free, because a refused bind disproves that answer
   -no-holders      skip the /proc/<pid>/fd walk
   -tables DIR      kernel socket table directory (default %s)
   -proc ROOT       procfs root used to name holders (default %s)
@@ -590,6 +734,7 @@ example
   portwhy why 127.0.0.1:8080
   portwhy why :53 -proto udp -json
   portwhy why :8080 -all
+  portwhy why :8080 -probe
   portwhy states
 `, procnet.DefaultDir, sockid.DefaultRoot)
 }

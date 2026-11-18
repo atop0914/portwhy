@@ -172,6 +172,10 @@ type Verdict struct {
 	TablesUnreadable []string
 	ProcsRead        int
 	ProcsDenied      int
+	// Probe is the empirical evidence the answer was allowed to use, in the
+	// order the attempts were made. Empty means no bind was attempted, which the
+	// reasons state in words rather than leaving a reader to infer.
+	Probe []probe.Attempt
 }
 
 // Explain classifies one address.
@@ -342,6 +346,7 @@ func Explain(q Query, tables []procnet.Table, env Env) Verdict {
 // probe is allowed to subtract is the bind-without-listen caveat, because that
 // caveat has just been tested and found false at that instant.
 func applyProbe(v Verdict, evidence []probe.Attempt) Verdict {
+	v.Probe = evidence
 	if len(evidence) == 0 {
 		v.Reasons = append(v.Reasons, Reason{Code: ReasonProbeNotRun})
 		return v
@@ -445,8 +450,8 @@ func probeRefused(v Verdict, plain, reuse *probe.Attempt) Verdict {
 		v.dropReason(ReasonUnlistedBinding)
 		v.Reasons = append(v.Reasons, Reason{
 			Code: ReasonProbeHolds,
-			Detail: fmt.Sprintf("no row covers this address, but a plain bind was refused with %s at %s: "+
-				"a socket bound without listen() holds it and appears in no table", plain.Errno, at),
+			Detail: fmt.Sprintf("a plain bind returned %s at %s while no row in the read tables "+
+				"mentions this port", plain.Errno, at),
 		})
 	case KindTimeWaitOnly:
 		// The difference between the attempts is the diagnosis. Without a

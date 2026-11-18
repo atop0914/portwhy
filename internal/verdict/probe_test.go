@@ -59,8 +59,8 @@ func TestProbeContradictsAFreeTableWithInvisibleHolder(t *testing.T) {
 	if !strings.Contains(detail, "EADDRINUSE") {
 		t.Errorf("detail %q does not name the errno", detail)
 	}
-	if !strings.Contains(detail, "listen") {
-		t.Errorf("detail %q does not name the kind of holder that can hide", detail)
+	if !strings.Contains(detail, probeAt.Format(time.RFC3339)) {
+		t.Errorf("detail %q does not say when the bind was refused", detail)
 	}
 	if hasReason(v, ReasonUnlistedBinding) {
 		t.Error("the caveat is now the answer, not a limit: it should not be listed as a blind spot")
