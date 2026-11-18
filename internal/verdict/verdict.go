@@ -17,7 +17,9 @@ import (
 	"net/netip"
 	"sort"
 	"strings"
+	"time"
 
+	"github.com/atop0914/portwhy/internal/probe"
 	"github.com/atop0914/portwhy/internal/procnet"
 )
 
@@ -67,6 +69,37 @@ const (
 	// /proc/net/tcp. It is stated on every "free" answer, the only answer it can
 	// invalidate.
 	ReasonUnlistedBinding = "bind-without-listen-not-listed"
+
+	// Probe reason codes. The probe is the only evidence that can contradict a
+	// table, so each way the two can disagree has its own code: folding them
+	// together would make "the table is stale" and "the table cannot see this
+	// kind of holder" read the same, and they need different fixes.
+	//
+	// ReasonProbeBound records that a plain bind really succeeded. It is the one
+	// probe result that closes a gap instead of opening one, so it is stated
+	// with the instant it happened and nothing more.
+	ReasonProbeBound = "bind-succeeded-at-probe-time"
+	// ReasonProbeRefused means the plain bind was refused. Consistent with a
+	// table that already showed a holder, and damning for one that showed none.
+	ReasonProbeRefused = "probe-bind-was-refused"
+	// ReasonProbeHolds is the headline case: the table showed nothing and a
+	// plain bind still failed. A socket bound without listen() is the only thing
+	// that can produce it, and it is exactly what no table can show.
+	ReasonProbeHolds = "bind-fails-but-table-shows-nothing"
+	// ReasonProbeOption means plain failed and SO_REUSEADDR succeeded: the
+	// reservation is a closed connection, and the fix is one socket option.
+	ReasonProbeOption = "reuseaddr-would-succeed"
+	// ReasonProbeDenied means the probe never got an answer about the address
+	// (EACCES, EADDRNOTAVAIL, ENOMEM). It is a hole in the evidence, not a free
+	// port.
+	ReasonProbeDenied = "probe-could-not-run"
+	// ReasonProbeGap means evidence was handed in without the attempt that the
+	// conclusion needs.
+	ReasonProbeGap = "probe-incomplete"
+	// ReasonProbeConflict means the probe succeeded where the table said
+	// something held the address. The table was read first, so the two describe
+	// different instants and this version cannot say which one the user faces.
+	ReasonProbeConflict = "table-and-probe-disagree"
 )
 
 // Owner is one process holding one socket, as this package needs to know it.
@@ -115,6 +148,12 @@ type Env struct {
 	// of the others must precede them. Nil is allowed — roles then stop at
 	// "sole" and "shared" instead of guessing.
 	PPID map[int]int
+	// Probe is what an empirical bind attempt found, handed in by the caller.
+	// Nothing in this package executes a probe: the evidence is an argument, so
+	// the judgement stays a function of its inputs and can be tested without a
+	// machine. Nil means no bind was attempted, which is disclosed rather than
+	// assumed away.
+	Probe []probe.Attempt
 }
 
 // Verdict is the answer plus the evidence it rests on.
@@ -173,7 +212,10 @@ func Explain(q Query, tables []procnet.Table, env Env) Verdict {
 			Code:   ReasonTableUnreadable,
 			Detail: fmt.Sprintf("could not read: %v", v.TablesUnreadable),
 		})
-		return v
+		// The probe cannot repair a table that was never read: it can only say
+		// what one instant looked like. It is still recorded, because a bind
+		// that succeeded is worth knowing about next to an unreadable table.
+		return applyProbe(v, env.Probe)
 	}
 
 	// Rows the kernel has already released are collected separately: they match
@@ -284,10 +326,221 @@ func Explain(q Query, tables []procnet.Table, env Env) Verdict {
 		})
 	}
 
-	// State only; the empirical bind probe is a later capability and this
-	// version must not imply it happened.
-	v.Reasons = append(v.Reasons, Reason{Code: ReasonProbeNotRun})
+	// State only unless a probe was actually made; the wording lives in
+	// applyProbe so that "not probed" and "probed, here is what happened" cannot
+	// both be said in one report.
+	return applyProbe(v, env.Probe)
+}
+
+// applyProbe folds the empirical evidence into the table-based answer.
+//
+// One direction only: a probe may make the answer more cautious, never more
+// optimistic. It can collapse "free" into "unknown" — and does, whenever it
+// disagrees with the table — but it may never promote anything to "free", even
+// when the bind succeeded: a bind that worked at 12:00:00.1 says nothing about
+// 12:00:00.2, and "free" is a claim about now. The single thing a successful
+// probe is allowed to subtract is the bind-without-listen caveat, because that
+// caveat has just been tested and found false at that instant.
+func applyProbe(v Verdict, evidence []probe.Attempt) Verdict {
+	if len(evidence) == 0 {
+		v.Reasons = append(v.Reasons, Reason{Code: ReasonProbeNotRun})
+		return v
+	}
+
+	plain, reuse := byMode(evidence)
+	if plain == nil {
+		// Evidence without a plain attempt cannot answer the question a probe
+		// exists to answer: SO_REUSEADDR succeeding while plain was never tried
+		// is not the "one option away" diagnosis, and must not be read as one.
+		v.Reasons = append(v.Reasons, Reason{
+			Code:   ReasonProbeGap,
+			Detail: "no plain attempt was recorded, so nothing is known about a plain bind",
+		})
+		if v.Kind == KindFree {
+			v.Kind = KindUnknown
+		}
+		return v
+	}
+	if plain.Err != "" {
+		// socket() refused or close() failed: this attempt is not evidence about
+		// the address at all.
+		v.Reasons = append(v.Reasons, Reason{Code: ReasonProbeDenied, Detail: plain.Err})
+		if v.Kind == KindFree {
+			v.Kind = KindUnknown
+		}
+		return v
+	}
+
+	switch plain.Outcome {
+	case probe.OutcomeBound:
+		return probeBound(v, *plain)
+	case probe.OutcomeAddrInUse:
+		return probeRefused(v, plain, reuse)
+	default:
+		// EACCES / EADDRNOTAVAIL / an errno this build does not classify / a
+		// probe that never ran. None of these is a statement about occupation,
+		// and the dangerous reading of any of them is "so the port is free".
+		v.Reasons = append(v.Reasons, Reason{
+			Code:   ReasonProbeDenied,
+			Detail: probeFailure(*plain),
+		})
+		if v.Kind == KindFree {
+			v.Kind = KindUnknown
+		}
+		return v
+	}
+}
+
+// probeBound handles a bind the kernel accepted.
+//
+// It cannot produce "free": that word is reserved for "every table was read and
+// nothing holds it", and a probe is not a table. What it can do is contradict a
+// table that named a holder, and remove the caveat it has just disproved.
+func probeBound(v Verdict, plain probe.Attempt) Verdict {
+	switch v.Kind {
+	case KindFree:
+		v.dropReason(ReasonUnlistedBinding)
+		v.Reasons = append(v.Reasons, Reason{
+			Code: ReasonProbeBound,
+			Detail: fmt.Sprintf("a plain bind succeeded at %s, so nothing — including a socket bound "+
+				"without listen() — held this address at that instant", plain.At.Format(time.RFC3339)),
+		})
+	case KindListening, KindTimeWaitOnly, KindOccupiedNonListening:
+		// The tables were read before the probe, so these describe two different
+		// instants. Either the holder went away in between or one of the two
+		// observations is wrong; this version cannot tell which, and naming a
+		// process that no longer holds the port is the one failure that sends a
+		// user to kill the wrong thing.
+		held := v.Kind
+		v.Kind = KindUnknown
+		v.Reasons = append(v.Reasons, Reason{
+			Code: ReasonProbeConflict,
+			Detail: fmt.Sprintf("the tables showed %s but a plain bind succeeded at %s: "+
+				"the tables were read first, so the two describe different instants",
+				held, plain.At.Format(time.RFC3339)),
+		})
+	default:
+		// A gap this version has no model for (an IPv6 wildcard that may shadow
+		// IPv4, an unreadable table). The bind is recorded; the gap stands.
+		v.Reasons = append(v.Reasons, Reason{
+			Code: ReasonProbeBound,
+			Detail: fmt.Sprintf("a plain bind succeeded at %s, but the evidence gap above still "+
+				"decides the answer", plain.At.Format(time.RFC3339)),
+		})
+	}
 	return v
+}
+
+// probeRefused handles a plain bind the kernel refused with EADDRINUSE.
+func probeRefused(v Verdict, plain, reuse *probe.Attempt) Verdict {
+	at := plain.At.Format(time.RFC3339)
+	switch v.Kind {
+	case KindFree:
+		// The whole reason this package exists. No table row covers the address,
+		// and the kernel still says someone holds it.
+		v.Kind = KindUnknown
+		// The blind spot has just been confirmed rather than closed, so it stops
+		// being a "limits" line: it is the diagnosis now, and saying both would
+		// read as two separate problems.
+		v.dropReason(ReasonUnlistedBinding)
+		v.Reasons = append(v.Reasons, Reason{
+			Code: ReasonProbeHolds,
+			Detail: fmt.Sprintf("no row covers this address, but a plain bind was refused with %s at %s: "+
+				"a socket bound without listen() holds it and appears in no table", plain.Errno, at),
+		})
+	case KindTimeWaitOnly:
+		// The difference between the attempts is the diagnosis. Without a
+		// successful SO_REUSEADDR attempt the reservation stays unexplained, and
+		// recommending the option would be the folklore this tool replaces.
+		if reuse != nil && reuse.Trustworthy() && reuse.Outcome == probe.OutcomeBound {
+			v.Reasons = append(v.Reasons, Reason{
+				Code: ReasonProbeOption,
+				Detail: fmt.Sprintf("plain bind was refused (%s) but SO_REUSEADDR succeeded at %s: "+
+					"the reservation is a closed connection, not a process", plain.Errno, at),
+			})
+			return v
+		}
+		v.Reasons = append(v.Reasons, Reason{
+			Code:   ReasonProbeRefused,
+			Detail: fmt.Sprintf("plain bind was refused with %s at %s; %s", plain.Errno, at, reuseVerdict(reuse)),
+		})
+	default:
+		v.Reasons = append(v.Reasons, Reason{
+			Code:   ReasonProbeRefused,
+			Detail: fmt.Sprintf("plain bind was refused with %s at %s, consistent with the rows above", plain.Errno, at),
+		})
+	}
+	return v
+}
+
+// reuseVerdict says what the option attempt found, so that "SO_REUSEADDR did not
+// help here" is as visible as the case where it did.
+func reuseVerdict(reuse *probe.Attempt) string {
+	switch {
+	case reuse == nil:
+		return "no SO_REUSEADDR attempt was recorded"
+	case !reuse.Trustworthy():
+		return fmt.Sprintf("the SO_REUSEADDR attempt itself failed: %s", reuseFailure(reuse))
+	case reuse.Outcome == probe.OutcomeAddrInUse:
+		return "SO_REUSEADDR was refused as well, so the option does not help here"
+	default:
+		return fmt.Sprintf("SO_REUSEADDR ended as %s", reuse.Outcome)
+	}
+}
+
+func probeFailure(a probe.Attempt) string {
+	return fmt.Sprintf("a plain bind could not be made (%s); that is not evidence the port is free",
+		attemptFailure(a))
+}
+
+func reuseFailure(a *probe.Attempt) string {
+	return attemptFailure(*a)
+}
+
+// attemptFailure names what went wrong without pretending it was an answer.
+func attemptFailure(a probe.Attempt) string {
+	switch {
+	case a.Outcome == probe.OutcomeNotRun:
+		return "the attempt never ran: " + a.Err
+	case a.Errno != "" && a.Message != "":
+		return a.Errno + " (" + a.Message + ")"
+	case a.Errno != "":
+		return a.Errno
+	case a.Message != "":
+		return a.Message
+	}
+	return string(a.Outcome)
+}
+
+// byMode picks the attempts applyProbe needs. Later attempts for the same mode
+// win: a caller that retried made the last observation, and mixing two
+// observations of the same mode would produce a report no single moment
+// supports.
+func byMode(evidence []probe.Attempt) (plain, reuse *probe.Attempt) {
+	for i := range evidence {
+		a := &evidence[i]
+		switch a.Mode {
+		case probe.ModePlain:
+			plain = a
+		case probe.ModeReuseAddr:
+			reuse = a
+		}
+	}
+	return plain, reuse
+}
+
+// dropReason removes every instance of a code. It exists for exactly one case:
+// a caveat that a probe has just disproved must not stay in the report, because
+// a reader cannot tell a stale caveat from a live one.
+func (v *Verdict) dropReason(code string) {
+	kept := v.Reasons[:0]
+	for _, r := range v.Reasons {
+		if r.Code == code {
+			continue
+		}
+		kept = append(kept, r)
+	}
+	v.Reasons = kept
 }
 
 // classify folds the findings into one kind, reading the consequence of each
