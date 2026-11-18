@@ -312,9 +312,9 @@ var reasonSentence = map[string]string{
 	verdict.ReasonUnknownState:    "a row used a state code this build does not know, so what it does to a bind cannot be stated",
 	verdict.ReasonUnlistedBinding: "a socket bound without listen() holds the port and has no row in these tables, so this answer cannot rule that out",
 	verdict.ReasonProbeBound:      "a plain bind succeeded, so the tables' silence was accurate at that instant and nothing — including a socket bound without listen() — held the address",
-	verdict.ReasonProbeRefused:    "a plain bind was refused, which is what the rows above predict",
+	verdict.ReasonProbeRefused:    "a plain bind was refused: something holds this address",
 	verdict.ReasonProbeHolds:      "a plain bind was refused while no row covers the address: something bound this port without listen(), and no table lists it",
-	verdict.ReasonProbeOption:     "a plain bind is refused but SO_REUSEADDR succeeds: the reservation belongs to a closed connection, not to a running process",
+	verdict.ReasonProbeOption:     "SO_REUSEADDR is what unblocks it — both attempts were made, and only the option one was accepted",
 	verdict.ReasonProbeDenied:     "the bind probe could not be made, so nothing was learned about the address — this is not a free port",
 	verdict.ReasonProbeGap:        "the probe evidence lacks the plain attempt that any conclusion about binding needs",
 	verdict.ReasonProbeConflict:   "the tables and the probe describe different instants, and this version cannot say which one you are facing",
@@ -380,6 +380,18 @@ func renderText(w io.Writer, v verdict.Verdict) error {
 	// attempts is the order the question is asked in.
 	if err := renderProbe(w, v.Probe); err != nil {
 		return err
+	}
+
+	// An empty "limits" heading is worse than none: it reads as "there are none"
+	// and as "the section failed to print" at the same time.
+	hasLimits := len(v.TablesUnreadable) > 0 || v.ProcsRead > 0
+	for _, r := range v.Reasons {
+		if limitReasons[r.Code] {
+			hasLimits = true
+		}
+	}
+	if !hasLimits {
+		return nil
 	}
 
 	if err := fprintf(w, "\nlimits\n"); err != nil {

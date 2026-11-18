@@ -165,8 +165,8 @@ func TestWhyProbeSplitsPlainFromReuseAddrOnTimeWait(t *testing.T) {
 	if !strings.Contains(out, "SO_REUSEADDR") {
 		t.Errorf("the option attempt result missing:\n%s", out)
 	}
-	if !strings.Contains(out, "a closed connection, not to a running process") {
-		t.Errorf("the report does not say what the reservation belongs to:\n%s", out)
+	if !strings.Contains(out, "SO_REUSEADDR is what unblocks it") {
+		t.Errorf("the report does not draw the conclusion the two attempts support:\n%s", out)
 	}
 }
 

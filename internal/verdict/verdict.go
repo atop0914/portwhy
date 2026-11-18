@@ -449,9 +449,8 @@ func probeRefused(v Verdict, plain, reuse *probe.Attempt) Verdict {
 		// read as two separate problems.
 		v.dropReason(ReasonUnlistedBinding)
 		v.Reasons = append(v.Reasons, Reason{
-			Code: ReasonProbeHolds,
-			Detail: fmt.Sprintf("a plain bind returned %s at %s while no row in the read tables "+
-				"mentions this port", plain.Errno, at),
+			Code:   ReasonProbeHolds,
+			Detail: fmt.Sprintf("a plain bind returned %s at %s", plain.Errno, at),
 		})
 	case KindTimeWaitOnly:
 		// The difference between the attempts is the diagnosis. Without a
@@ -459,20 +458,22 @@ func probeRefused(v Verdict, plain, reuse *probe.Attempt) Verdict {
 		// recommending the option would be the folklore this tool replaces.
 		if reuse != nil && reuse.Trustworthy() && reuse.Outcome == probe.OutcomeBound {
 			v.Reasons = append(v.Reasons, Reason{
-				Code: ReasonProbeOption,
-				Detail: fmt.Sprintf("plain bind was refused (%s) but SO_REUSEADDR succeeded at %s: "+
-					"the reservation is a closed connection, not a process", plain.Errno, at),
+				Code:   ReasonProbeOption,
+				Detail: fmt.Sprintf("plain refused with %s, SO_REUSEADDR bound at %s", plain.Errno, at),
 			})
 			return v
 		}
 		v.Reasons = append(v.Reasons, Reason{
 			Code:   ReasonProbeRefused,
-			Detail: fmt.Sprintf("plain bind was refused with %s at %s; %s", plain.Errno, at, reuseVerdict(reuse)),
+			Detail: fmt.Sprintf("plain bind returned %s at %s; %s", plain.Errno, at, reuseVerdict(reuse)),
 		})
 	default:
+		// A visible holder (or an unreadable table). "Something holds it" is the
+		// one sentence that is true of both, and the errno is what makes it
+		// evidence rather than repetition.
 		v.Reasons = append(v.Reasons, Reason{
 			Code:   ReasonProbeRefused,
-			Detail: fmt.Sprintf("plain bind was refused with %s at %s, consistent with the rows above", plain.Errno, at),
+			Detail: fmt.Sprintf("plain bind returned %s at %s; %s", plain.Errno, at, reuseVerdict(reuse)),
 		})
 	}
 	return v
