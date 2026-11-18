@@ -272,6 +272,34 @@ func TestProbeEvidenceIsDeterministic(t *testing.T) {
 	}
 }
 
+// The caveat belongs to a free answer and to nothing else. Leaving it next to a
+// diagnosis that already covers it gives a reader two problems to solve and no
+// way to tell that they are one.
+func TestTheUnlistedCaveatOnlyAppearsOnAFreeAnswer(t *testing.T) {
+	cases := map[string]struct {
+		probe []probe.Attempt
+		want  bool
+	}{
+		"no probe, free":      {nil, true},
+		"bound, free":         {[]probe.Attempt{attempt(probe.ModePlain, probe.OutcomeBound, "")}, false},
+		"refused, unknown":    {[]probe.Attempt{attempt(probe.ModePlain, probe.OutcomeAddrInUse, "EADDRINUSE")}, false},
+		"denied, unknown":     {[]probe.Attempt{attempt(probe.ModePlain, probe.OutcomeNotPermitted, "EACCES")}, false},
+		"untidy, unknown":     {[]probe.Attempt{{Mode: probe.ModePlain, At: probeAt, Outcome: probe.OutcomeBound, Err: "close: bad file descriptor"}}, false},
+		"not run, unknown":    {[]probe.Attempt{{Mode: probe.ModePlain, At: probeAt, Outcome: probe.OutcomeNotRun, Err: "socket: refused"}}, false},
+		"incomplete, unknown": {[]probe.Attempt{attempt(probe.ModeReuseAddr, probe.OutcomeBound, "")}, false},
+	}
+	for name, tc := range cases {
+		v := Explain(query("127.0.0.1", 8080, procnet.TCP), freeTables(), Env{Probe: tc.probe})
+		got := hasReason(v, ReasonUnlistedBinding)
+		if got != tc.want {
+			t.Errorf("%s: caveat present = %v, want %v (kind %s)", name, got, tc.want, v.Kind)
+		}
+		if got && v.Kind != KindFree {
+			t.Errorf("%s: the caveat survived an answer that is not free (%s)", name, v.Kind)
+		}
+	}
+}
+
 // Without evidence the report must still say no bind was attempted: a reader
 // who cannot tell "not probed" from "probed and free" will trust the wrong line.
 func TestNoProbeStillDisclosesThatNothingWasAttempted(t *testing.T) {

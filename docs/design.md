@@ -28,7 +28,7 @@ every week.
 | `free` | every relevant table was read successfully and no row occupies the address | a socket in an unread table; a namespace we cannot see; a bind that fails for a reason other than the address being held (`EACCES` below 1024, `EADDRNOTAVAIL`) |
 | `listening` | a row in `LISTEN` whose local address covers the query | nothing: the row is the state |
 | `time-wait-only` | rows in `TIME_WAIT` and nothing else | a non-`TIME_WAIT` row in an unread table |
-| `occupied-non-listening` | rows in another bound state | whether the bind actually fails: it may not, if `SO_REUSEADDR`/`SO_REUSEPORT` is set. This version reports the occupation and says the consequence is unverified |
+| `occupied-non-listening` | rows in another bound state | whether the bind actually fails: it may not, if `SO_REUSEADDR`/`SO_REUSEPORT` is set. Without a probe this version reports the occupation and says the consequence is unverified; with `--probe` the consequence is measured, and a successful bind becomes a conflict rather than a quiet contradiction |
 | `unknown` | a table that should exist could not be read, or an IPv6 wildcard may be shadowing IPv4 | nothing: `unknown` is the honest floor |
 
 The `free` row carries the risk. It is the only kind that tells a user "go
@@ -55,6 +55,25 @@ describe is a hole in the evidence, and `UNKNOWN(0x..)` in the output is the too
 saying so. And `CLOSE` is not a holder — the row is disclosed in the reasons and
 left out of the holders list, because naming a process for a socket the kernel has
 released sends the reader off to kill something that is already gone.
+
+### The probe, and the one direction it may move
+
+The probe is the only evidence that can contradict the tables, so the direction it
+is allowed to move the answer is fixed in code, not in prose: **it may make the
+answer more cautious, never more optimistic.**
+
+| tables said | plain bind | outcome | why |
+|---|---|---|---|
+| `free` | refused `EADDRINUSE` | `unknown` | the tables cannot see a socket bound without `listen()`; one `bind()` can |
+| `free` | accepted | `free`, caveat removed | the blind spot was tested at that instant and did not materialise |
+| `free` | `EACCES` / `EADDRNOTAVAIL` / not run | `unknown` | the probe did not answer; a non-answer is not a free port |
+| `listening`, `time-wait-only`, `occupied` | refused `EADDRINUSE` | unchanged | corroboration, and nothing more |
+| `time-wait-only` | refused, `SO_REUSEADDR` accepted | unchanged | the option is the fix, and it is named as tried, not recommended |
+| `listening`, `time-wait-only`, `occupied` | accepted | `unknown` | the tables were read first, so the two describe different instants |
+
+Nothing enters the `free` column from any row that was not already `free`. That is
+what keeps the probe from becoming a second opinion that can be talked into a
+reassuring answer.
 
 ## 3. Capability boundary
 
@@ -90,8 +109,9 @@ released sends the reader off to kill something that is already gone.
   it never silently allows.
 - **Why a specific `bind()` failed.** `EACCES` (privileged port), `EADDRNOTAVAIL`
   (address not on any interface) and `EADDRINUSE` are three different errors that
-  arrive as the same failure to a user. Only a probe can distinguish them; this
-  version classifies the address, not the error.
+  arrive as the same failure to a user. Tables can only classify the address; with
+  `--probe` the errno is read directly, and every errno that is not `EADDRINUSE`
+  is treated as "the probe did not answer", never as "so the port is free".
 - **Whether the holder is the one you care about.** A forked worker inherits its
   parent's listener; both are reported, and choosing between them is the user's
   job.
@@ -99,8 +119,9 @@ released sends the reader off to kill something that is already gone.
   `bind()` fails with `EADDRINUSE` — and it has no row in any `/proc/net` table,
   because those tables iterate only the connection and listener hashes. This is
   measured, not assumed (`cmd/portwhy/live_linux_test.go`), and it is why every
-  `free` answer carries the `bind-without-listen-not-listed` caveat. Only a probe
-  can close it.
+  `free` answer carries the `bind-without-listen-not-listed` caveat. Only a bind
+  attempt can close it: with `--probe`, a refused plain bind collapses `free` into
+  `unknown` and the caveat becomes the diagnosis (`cmd/portwhy/probe_linux_test.go`).
 - **Who opened a shared socket when the descriptor was passed.** A role is derived
   from the process tree, which proves descent and nothing else. When several
   holders are unrelated (systemd socket activation hands the listener to a service
@@ -120,14 +141,17 @@ released sends the reader off to kill something that is already gone.
 ```
 internal/procnet   files → []Socket          (pure over an io.Reader)
 internal/sockid    inodes → holders          (the only /proc/<pid> walker)
-internal/verdict   []Socket + query → Kind   (pure; injected holder lookup)
+internal/probe     address → []Attempt       (real bind(); never listen())
+internal/verdict   []Socket + attempts → Kind (pure; evidence is an argument)
 cmd/portwhy        rendering, exit codes
 ```
 
 The invariant worth defending: **`internal/verdict` never touches the system.**
-Every conclusion is a function of rows it was given. That is what makes the
-false-positive and false-negative cases testable without a socket, and it is why
-the exit-code contract can be argued about without a machine.
+Every conclusion is a function of rows and attempts it was given. That is what
+makes the false-positive and false-negative cases testable without a socket, and
+it is why the exit-code contract can be argued about without a machine. The probe
+is deliberately on the other side of that line: it produces evidence, the verdict
+consumes it, and `Explain` never runs one.
 
 The second invariant: **a missing table is not an unreadable table.** A kernel
 without IPv6 has no `tcp6`; that hides nothing about an IPv4 question and must
@@ -158,20 +182,41 @@ Each of these is a test today, and each is a way the tool could become harmful:
 - A `free` answer without the `bind-without-listen-not-listed` caveat is a
   regression: that is the one blind spot the tables have, and the one answer it can
   invalidate.
+- A refused bind on a port no table lists must turn `free` into `unknown`, and the
+  caveat must stop being printed as a limits line once it is the diagnosis.
+- A successful plain bind must not promote anything to `free` — it may only
+  subtract the caveat it just disproved.
+- A probe that could not run (`EACCES`, `EADDRNOTAVAIL`, `socket()` or `close()`
+  failure) must never leave `free` standing.
+- `SO_REUSEADDR` must not be recommended unless the option attempt actually
+  succeeded: one attempt is not the two-attempt diagnosis, and the refusal must be
+  reported as "the option does not help here".
+- A probe result must carry the instant it was taken, in text and in JSON, and no
+  output may offer a guarantee.
 
-## 6. What changes later
+## 6. What the probe does, and what is still later
 
-The probe (a later capability) will `bind()` four ways — plain, `SO_REUSEADDR`,
-`SO_REUSEPORT`, and IPv6-only — and report what the kernel actually did. That
-turns three current uncertainties into facts: whether a `TIME_WAIT` row blocks
-this program, whether `[::]` shadows IPv4 here, and which errno the bind really
-returns. It also closes the blind spot the tables have by construction: a port that
-looks free but is held by a socket that was bound without `listen()`.
+The probe binds twice — plain, then `SO_REUSEADDR` — and reports the errno and the
+instant of each attempt. Two rather than four, on purpose:
 
-Two rules for that work, decided now so they are not decided under pressure:
+- `SO_REUSEPORT` is not attempted. Joining an existing listener's group can steal
+  a connection for the duration of the probe, and that is a side effect this
+  version is not willing to cause silently.
+- An IPv6-only attempt is not made. Whether `[::]` shadows IPv4 depends on
+  `net.ipv6.bindv6only`, so the fix is to measure that flag, not to add a fourth
+  attempt whose result would need the same interpretation.
 
-- The probe is **opt-in** (`--probe`), because `SO_REUSEPORT` can join an
-  existing listener's group and steal a connection for the duration of the probe.
+What the two attempts settle today: whether a `TIME_WAIT` row blocks a plain bind
+here, whether the option unblocks it, and which errno a bind really returns. What
+they do not settle: the IPv6 shadow question, and anything about a `bind()` that
+happens after the probe — which is why the report prints the instant instead of a
+verdict about the future.
+
+Two rules for this work, decided before it was written so they were not decided
+under pressure:
+
+- The probe is **opt-in** (`--probe`). Without it the report is byte-identical to
+  the table-only version, and the exit-code contract does not change.
 - A probe result is labelled with the moment it was taken. Between the probe and
   the user's own `bind()`, the state can change; the report must not present a
   probe as a guarantee.

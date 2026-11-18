@@ -346,6 +346,18 @@ func Explain(q Query, tables []procnet.Table, env Env) Verdict {
 // probe is allowed to subtract is the bind-without-listen caveat, because that
 // caveat has just been tested and found false at that instant.
 func applyProbe(v Verdict, evidence []probe.Attempt) Verdict {
+	v = foldProbe(v, evidence)
+	if v.Kind != KindFree {
+		// The caveat is a limit on a free answer and on nothing else. Once the
+		// answer is no longer free, keeping it would put a blind spot next to a
+		// diagnosis that already covers it, and a reader cannot tell the two
+		// apart.
+		v.dropReason(ReasonUnlistedBinding)
+	}
+	return v
+}
+
+func foldProbe(v Verdict, evidence []probe.Attempt) Verdict {
 	v.Probe = evidence
 	if len(evidence) == 0 {
 		v.Reasons = append(v.Reasons, Reason{Code: ReasonProbeNotRun})
@@ -369,7 +381,10 @@ func applyProbe(v Verdict, evidence []probe.Attempt) Verdict {
 	if plain.Err != "" {
 		// socket() refused or close() failed: this attempt is not evidence about
 		// the address at all.
-		v.Reasons = append(v.Reasons, Reason{Code: ReasonProbeDenied, Detail: plain.Err})
+		v.Reasons = append(v.Reasons, Reason{
+			Code:   ReasonProbeDenied,
+			Detail: "the attempt did not complete cleanly: " + plain.Err,
+		})
 		if v.Kind == KindFree {
 			v.Kind = KindUnknown
 		}
@@ -494,9 +509,13 @@ func reuseVerdict(reuse *probe.Attempt) string {
 	}
 }
 
+// probeFailure states the fact and nothing else: what it means for the answer is
+// the sentence the code carries, and repeating it here reads as two findings.
 func probeFailure(a probe.Attempt) string {
-	return fmt.Sprintf("a plain bind could not be made (%s); that is not evidence the port is free",
-		attemptFailure(a))
+	if a.Outcome == probe.OutcomeNotRun {
+		return "no bind could be made: " + a.Err
+	}
+	return fmt.Sprintf("plain bind returned %s at %s", attemptFailure(a), a.At.Format(time.RFC3339))
 }
 
 func reuseFailure(a *probe.Attempt) string {

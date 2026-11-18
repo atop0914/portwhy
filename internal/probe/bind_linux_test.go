@@ -3,8 +3,10 @@
 package probe
 
 import (
+	"bytes"
 	"net"
 	"net/netip"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -203,4 +205,25 @@ func TestBindSpeaksBothFamilies(t *testing.T) {
 func portOf(t *testing.T) uint16 {
 	t.Helper()
 	return freePort(t).Port()
+}
+
+// The probe must never call listen(): a listener completes handshakes on the
+// user's behalf, and listen()+close() is indistinguishable from bind()+close()
+// to every outside observer — a client that dials during the window cannot be
+// asked afterwards. So the invariant is asserted where it is enforced, in the
+// source, instead of being asserted about behaviour it cannot see.
+//
+// This is deliberately narrow: it would not catch a listener reached through a
+// helper in another file, and it is not meant to. It catches the one edit that
+// is tempting to make.
+func TestProbeSourceNeverListens(t *testing.T) {
+	src, err := os.ReadFile("bind_linux.go")
+	if err != nil {
+		t.Fatalf("read own source: %v", err)
+	}
+	for _, forbidden := range []string{"syscall.Listen(", "net.Listen("} {
+		if bytes.Contains(src, []byte(forbidden)) {
+			t.Errorf("the probe calls %s: binding is enough to learn the answer, listening is not ours to do", forbidden)
+		}
+	}
 }
