@@ -774,9 +774,9 @@ flags for "why"
                    free, because a refused bind disproves that answer
   -no-holders      skip the /proc/<pid>/fd walk
   -tables DIR      kernel socket table directory (default %s)
-  -sysctl DIR      kernel tunable directory, used for net.ipv6.bindv6only
-                   (default %s). Only this one tunable is read, and it is read
-                   to answer whether a [::] listener also holds IPv4
+  -sysctl DIR      kernel tunable directory (default %s). Only
+                   net/ipv6.bindv6only is read, to answer whether a [::]
+                   listener also holds IPv4
   -proc ROOT       procfs root used to name holders (default %s)
 
 exit codes
