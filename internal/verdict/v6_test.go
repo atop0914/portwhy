@@ -278,3 +278,58 @@ func TestDeniedProbeKeepsThePerSocketCaveat(t *testing.T) {
 		t.Errorf("kind = %v, want listening: an EACCES probe says nothing about occupation", v.Kind)
 	}
 }
+
+// The case the caveat exists for, measured: the wildcard looked dual-stack and a
+// bind succeeded, so that listener set IPV6_V6ONLY for itself. The report must
+// say this, and must not keep the claim the probe just disproved — two
+// contradictory sentences in one report are worse than a gap.
+func TestProbeRevealsTheWildcardOptedOut(t *testing.T) {
+	v := Explain(query("127.0.0.1", 8080, procnet.TCP), wildcardTables(), Env{
+		V6Only: dualStack(),
+		Probe:  []probe.Attempt{attempt(probe.ModePlain, probe.OutcomeBound, "")},
+	})
+	if v.Kind != KindUnknown {
+		t.Fatalf("kind = %v, want unknown: a successful bind may not promote the answer to free", v.Kind)
+	}
+	if hasReason(v, ReasonV6Shadow) {
+		t.Error("the disproved shadow claim is still in the report")
+	}
+	if hasReason(v, ReasonV6PerSocket) {
+		t.Error("the caveat survived the measurement that settled it")
+	}
+	detail, ok := reasonDetail(v, ReasonV6OptOut)
+	if !ok {
+		t.Fatal("missing ipv6-wildcard-turned-out-ipv6-only reason")
+	}
+	if !strings.Contains(detail, "[::]:8080") {
+		t.Errorf("detail %q does not name the socket", detail)
+	}
+	if hasReason(v, ReasonProbeConflict) {
+		t.Error("reported a stale table: both observations are of the same instant, and the reason differs")
+	}
+	if hasReason(v, ReasonUnlistedBinding) {
+		t.Error("an unknown answer kept the free-only caveat")
+	}
+}
+
+// A v4 listener plus a shadow: then a successful bind really does contradict the
+// table, and the generic conflict sentence is the right one.
+func TestProbeConflictWithARealIPv4ListenerStaysAConflict(t *testing.T) {
+	tables := []procnet.Table{
+		table("tcp", procnet.TCP, procnet.V4, sock(procnet.StateListen, "127.0.0.1", 8080, procnet.TCP)),
+		table("tcp6", procnet.TCP, procnet.V6, sock(procnet.StateListen, "::", 8080, procnet.TCP)),
+	}
+	v := Explain(query("127.0.0.1", 8080, procnet.TCP), tables, Env{
+		V6Only: dualStack(),
+		Probe:  []probe.Attempt{attempt(probe.ModePlain, probe.OutcomeBound, "")},
+	})
+	if v.Kind != KindUnknown {
+		t.Fatalf("kind = %v, want unknown", v.Kind)
+	}
+	if !hasReason(v, ReasonProbeConflict) {
+		t.Error("missing table-and-probe-disagree reason")
+	}
+	if hasReason(v, ReasonV6OptOut) {
+		t.Error("blamed the v6 socket although an IPv4 listener was also in the table")
+	}
+}

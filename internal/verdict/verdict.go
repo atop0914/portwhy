@@ -69,7 +69,13 @@ const (
 	// setsockopt(IPV6_V6ONLY, 1) regardless. The kernel exposes no column for
 	// it, so the shadow claim is "true unless that listener opted out", and only
 	// a bind attempt can settle which.
-	ReasonV6PerSocket  = "ipv6-v6only-is-per-socket"
+	ReasonV6PerSocket = "ipv6-v6only-is-per-socket"
+	// ReasonV6OptOut is what a successful bind adds to a shadow claim: the
+	// socket that looked dual-stack is IPv6-only for itself. The kernel
+	// publishes no column for that, so the only way to learn it is to try — and
+	// it is a different finding from "the table was stale", because both
+	// observations describe the same instant.
+	ReasonV6OptOut     = "ipv6-wildcard-turned-out-ipv6-only"
 	ReasonNoOwnerInode = "no-inode-so-no-owner"
 	ReasonProcsDenied  = "some-processes-unreadable"
 	ReasonProbeNotRun  = "bind-not-probed"
@@ -389,17 +395,14 @@ func foldV6Wildcard(v Verdict, shadow procnet.Socket, env Env) Verdict {
 		v.Reasons = append(v.Reasons,
 			Reason{
 				Code:   ReasonV6Shadow,
-				Detail: fmt.Sprintf("%s also holds this address; %s", shadow.Local, env.V6Only.Describe()),
+				Detail: fmt.Sprintf("%s; %s", shadow.Local, env.V6Only.Describe()),
 			},
-			Reason{
-				Code:   ReasonV6PerSocket,
-				Detail: "bindv6only is the default for new sockets; a listener that set IPV6_V6ONLY=1 for itself would leave IPv4 free, and only a bind attempt can tell",
-			},
+			Reason{Code: ReasonV6PerSocket},
 		)
 	default:
 		v.Reasons = append(v.Reasons, Reason{
 			Code:   ReasonV6NoShadow,
-			Detail: fmt.Sprintf("%s does not hold this address; %s", shadow.Local, env.V6Only.Describe()),
+			Detail: fmt.Sprintf("%s; %s", shadow.Local, env.V6Only.Describe()),
 		})
 	}
 	return v
@@ -454,6 +457,31 @@ func applyProbe(v Verdict, evidence []probe.Attempt) Verdict {
 func plainRefused(evidence []probe.Attempt) bool {
 	plain, _ := byMode(evidence)
 	return plain != nil && plain.Trustworthy() && plain.Outcome == probe.OutcomeAddrInUse
+}
+
+// shadowOnly reports whether the v6 wildcard is the only thing holding the
+// address. That is the shape in which a successful bind is a statement about
+// that one socket, rather than proof that the table was out of date.
+func shadowOnly(v Verdict) bool {
+	if !hasReasonCode(v, ReasonV6Shadow) || len(v.Findings) == 0 {
+		return false
+	}
+	for _, f := range v.Findings {
+		ip := f.Socket.Local.IP.Unmap()
+		if !ip.Is6() || !ip.IsUnspecified() {
+			return false
+		}
+	}
+	return true
+}
+
+func hasReasonCode(v Verdict, code string) bool {
+	for _, r := range v.Reasons {
+		if r.Code == code {
+			return true
+		}
+	}
+	return false
 }
 
 func foldProbe(v Verdict, evidence []probe.Attempt) Verdict {
@@ -525,6 +553,24 @@ func probeBound(v Verdict, plain probe.Attempt) Verdict {
 				"without listen() — held this address at that instant", plain.At.Format(time.RFC3339)),
 		})
 	case KindListening, KindTimeWaitOnly, KindOccupiedNonListening:
+		if v.Kind == KindListening && shadowOnly(v) {
+			// The only evidence was a v6 wildcard that the tunable called
+			// dual-stack, and the bind it predicted would fail did not. That is
+			// one instant with one explanation — the socket is IPv6-only for
+			// itself, which no table reports — not a stale table and not two
+			// moments that disagree. Calling it the latter would invent a
+			// mechanism that did not happen.
+			held := v.Findings[0].Socket.Local
+			v.dropReason(ReasonV6Shadow)
+			v.dropReason(ReasonV6PerSocket)
+			v.Kind = KindUnknown
+			v.Reasons = append(v.Reasons, Reason{
+				Code: ReasonV6OptOut,
+				Detail: fmt.Sprintf("a plain bind succeeded at %s although %s is listening on this port",
+					plain.At.Format(time.RFC3339), held),
+			})
+			return v
+		}
 		// The tables were read before the probe, so these describe two different
 		// instants. Either the holder went away in between or one of the two
 		// observations is wrong; this version cannot tell which, and naming a
