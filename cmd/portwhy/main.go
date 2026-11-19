@@ -20,6 +20,7 @@ import (
 	"github.com/atop0914/portwhy/internal/probe"
 	"github.com/atop0914/portwhy/internal/procnet"
 	"github.com/atop0914/portwhy/internal/sockid"
+	"github.com/atop0914/portwhy/internal/sysctl"
 	"github.com/atop0914/portwhy/internal/verdict"
 	"github.com/atop0914/portwhy/internal/version"
 )
@@ -110,6 +111,7 @@ func runWhy(args []string, stdout, stderr io.Writer) int {
 	proto := fs.String("proto", "tcp", "protocol to check: tcp or udp")
 	asJSON := fs.Bool("json", false, "emit a JSON report instead of text")
 	tableDir := fs.String("tables", procnet.DefaultDir, "directory holding the kernel socket tables")
+	sysctlDir := fs.String("sysctl", sysctl.DefaultDir, "directory holding the kernel tunables")
 	procRoot := fs.String("proc", sockid.DefaultRoot, "procfs root used to name the holder")
 	skipHolders := fs.Bool("no-holders", false, "do not walk /proc/<pid>/fd: kernel state only")
 	showAll := fs.Bool("all", false, "also list every row on this port, with why it did or did not take part")
@@ -142,7 +144,13 @@ func runWhy(args []string, stdout, stderr io.Writer) int {
 
 	tables := procnet.ReadAll(*tableDir)
 
-	env := verdict.Env{}
+	// The one tunable that decides whether a [::] listener also holds IPv4. It
+	// is read unconditionally — one small file — and handed to the judgement as
+	// evidence, so that a failed read is reported as a hole and not replaced by
+	// the value Linux usually has.
+	measuredV6Only := sysctl.ReadBindV6Only(*sysctlDir)
+
+	env := verdict.Env{V6Only: measuredV6Only}
 	if !*skipHolders {
 		idx, err := sockid.Scan(*procRoot)
 		if err != nil {
@@ -304,7 +312,10 @@ var reasonSentence = map[string]string{
 	verdict.ReasonTimeWait:        "the reservation belongs to a closed connection, not to a running process",
 	verdict.ReasonOtherState:      "a bound socket in a non-listening state holds this address; whether bind() fails depends on socket options",
 	verdict.ReasonTableUnreadable: "a socket table could not be read, so absence of a row proves nothing",
-	verdict.ReasonV6Wildcard:      "an IPv6 wildcard listener may also occupy IPv4, depending on net.ipv6.bindv6only",
+	verdict.ReasonV6Wildcard:      "whether the IPv6 wildcard listener also holds this IPv4 address could not be answered: net.ipv6.bindv6only was not readable, and a default is not a measurement",
+	verdict.ReasonV6Shadow:        "the IPv6 wildcard listener holds this IPv4 address too: this host runs with bindv6only=0, so a [::] socket is dual-stack",
+	verdict.ReasonV6NoShadow:      "the IPv6 wildcard listener does not hold this IPv4 address: this host runs with bindv6only=1, so [::] is IPv6 only",
+	verdict.ReasonV6PerSocket:     "bindv6only is the default for new sockets, not a property of an existing one: a listener that asked for IPV6_V6ONLY itself would leave IPv4 free, and the kernel publishes no column for it",
 	verdict.ReasonNoOwnerInode:    "a row with inode 0 has no descriptor behind it (TIME_WAIT, or a socket closed and waiting out its timeout), so no process can be named for it",
 	verdict.ReasonProcsDenied:     "some processes could not be read, so an unnamed holder may exist",
 	verdict.ReasonProbeNotRun:     "no bind was attempted: this verdict comes from kernel state only",
@@ -330,6 +341,7 @@ var limitReasons = map[string]bool{
 	verdict.ReasonProcsDenied:     true,
 	verdict.ReasonNoOwnerInode:    true,
 	verdict.ReasonV6Wildcard:      true,
+	verdict.ReasonV6PerSocket:     true,
 	verdict.ReasonUnlistedBinding: true,
 }
 
@@ -631,6 +643,32 @@ type jsonEvidence struct {
 	TablesUnreadable []string `json:"tables_unreadable"`
 	ProcsRead        int      `json:"procs_read"`
 	ProcsDenied      int      `json:"procs_denied"`
+	// BindV6Only is the tunable an IPv6 wildcard answer depends on. It is always
+	// present, including when it could not be read: a consumer that only sees a
+	// value would never learn that the value was missing.
+	BindV6Only jsonBindV6Only `json:"bindv6only"`
+}
+
+// jsonBindV6Only has no zero value that reads as a measurement. Measured is the
+// switch, and Value is a pointer so that a failed read cannot be decoded as 0 —
+// the one mistake that would turn "I could not look" into "dual-stack".
+type jsonBindV6Only struct {
+	Measured bool   `json:"measured"`
+	Value    *int   `json:"value,omitempty"`
+	Raw      string `json:"raw,omitempty"`
+	Path     string `json:"path"`
+	Error    string `json:"error,omitempty"`
+}
+
+func jsonV6Only(b sysctl.BindV6Only) jsonBindV6Only {
+	out := jsonBindV6Only{Path: b.Path, Error: b.Err}
+	if v, ok := b.Value(); ok {
+		value := v
+		out.Measured = true
+		out.Value = &value
+		out.Raw = strings.TrimSpace(b.Raw)
+	}
+	return out
 }
 
 func renderJSON(w io.Writer, v verdict.Verdict) error {
@@ -645,6 +683,7 @@ func renderJSON(w io.Writer, v verdict.Verdict) error {
 			TablesUnreadable: v.TablesUnreadable,
 			ProcsRead:        v.ProcsRead,
 			ProcsDenied:      v.ProcsDenied,
+			BindV6Only:       jsonV6Only(v.V6Only),
 		},
 		Version: version.Resolve().Version,
 	}
@@ -734,6 +773,9 @@ flags for "why"
                    free, because a refused bind disproves that answer
   -no-holders      skip the /proc/<pid>/fd walk
   -tables DIR      kernel socket table directory (default %s)
+  -sysctl DIR      kernel tunable directory, used for net.ipv6.bindv6only
+                   (default %s). Only this one tunable is read, and it is read
+                   to answer whether a [::] listener also holds IPv4
   -proc ROOT       procfs root used to name holders (default %s)
 
 exit codes
@@ -748,7 +790,7 @@ example
   portwhy why :8080 -all
   portwhy why :8080 -probe
   portwhy states
-`, procnet.DefaultDir, sockid.DefaultRoot)
+`, procnet.DefaultDir, sysctl.DefaultDir, sockid.DefaultRoot)
 }
 
 func fprintf(w io.Writer, format string, a ...any) error {
