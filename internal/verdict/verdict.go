@@ -21,6 +21,7 @@ import (
 
 	"github.com/atop0914/portwhy/internal/probe"
 	"github.com/atop0914/portwhy/internal/procnet"
+	"github.com/atop0914/portwhy/internal/sysctl"
 )
 
 // Kind is the answer. The names are stable: they appear in JSON output and in
@@ -54,9 +55,24 @@ const (
 	ReasonOtherState      = "non-listening-state"
 	ReasonTableUnreadable = "table-unreadable"
 	ReasonV6Wildcard      = "ipv6-wildcard-may-shadow-ipv4"
-	ReasonNoOwnerInode    = "no-inode-so-no-owner"
-	ReasonProcsDenied     = "some-processes-unreadable"
-	ReasonProbeNotRun     = "bind-not-probed"
+	// ReasonV6Shadow is the wildcard question answered with the machine's own
+	// setting: net.ipv6.bindv6only is 0, so the [::] listener is dual-stack and
+	// holds the IPv4 address as well. It is a different sentence from
+	// ReasonListener because the row and the query are in different families,
+	// and a reader who cannot see that would think the tool compared wrongly.
+	ReasonV6Shadow = "ipv6-wildcard-holds-ipv4"
+	// ReasonV6NoShadow is the same question answered the other way: the setting
+	// is 1, so [::] is IPv6 only and leaves this IPv4 address alone.
+	ReasonV6NoShadow = "ipv6-wildcard-does-not-hold-ipv4"
+	// ReasonV6PerSocket limits ReasonV6Shadow. bindv6only is the default for
+	// new sockets, not a property of an existing one: a program can call
+	// setsockopt(IPV6_V6ONLY, 1) regardless. The kernel exposes no column for
+	// it, so the shadow claim is "true unless that listener opted out", and only
+	// a bind attempt can settle which.
+	ReasonV6PerSocket  = "ipv6-v6only-is-per-socket"
+	ReasonNoOwnerInode = "no-inode-so-no-owner"
+	ReasonProcsDenied  = "some-processes-unreadable"
+	ReasonProbeNotRun  = "bind-not-probed"
 	// ReasonTeardown records rows that were seen on the address and discarded
 	// because the kernel had already released them. Silently dropping them
 	// would make the report disagree with the table a user is looking at.
@@ -154,6 +170,12 @@ type Env struct {
 	// machine. Nil means no bind was attempted, which is disclosed rather than
 	// assumed away.
 	Probe []probe.Attempt
+	// V6Only is what net.ipv6.bindv6only measured on this host. It is an
+	// argument for the same reason the probe is: the judgement stays a function
+	// of its inputs, and "could not read it" stays distinguishable from "it is
+	// 0". The zero value means nobody measured, and that is answered with
+	// unknown rather than with the value Linux usually has.
+	V6Only sysctl.BindV6Only
 }
 
 // Verdict is the answer plus the evidence it rests on.
@@ -176,6 +198,10 @@ type Verdict struct {
 	// order the attempts were made. Empty means no bind was attempted, which the
 	// reasons state in words rather than leaving a reader to infer.
 	Probe []probe.Attempt
+	// V6Only is the measurement this answer was allowed to use, recorded whether
+	// or not it changed anything: a report that cites a tunable has to be able
+	// to show what it read.
+	V6Only sysctl.BindV6Only
 }
 
 // Explain classifies one address.
@@ -183,7 +209,7 @@ type Verdict struct {
 // The order of the checks is the honesty of the result: an unreadable table is
 // settled first, so that no later branch can turn a blind spot into "free".
 func Explain(q Query, tables []procnet.Table, env Env) Verdict {
-	v := Verdict{Query: q, ProcsRead: env.ProcsRead, ProcsDenied: env.ProcsDenied}
+	v := Verdict{Query: q, ProcsRead: env.ProcsRead, ProcsDenied: env.ProcsDenied, V6Only: env.V6Only}
 
 	var relevant []procnet.Table
 	for _, t := range tables {
@@ -252,16 +278,7 @@ func Explain(q Query, tables []procnet.Table, env Env) Verdict {
 	// Findings are ordered for reproducible output: listeners first, then by
 	// address, then by state. A report whose row order changes between runs is
 	// a report nobody can diff.
-	sort.SliceStable(v.Findings, func(i, j int) bool {
-		a, b := v.Findings[i].Socket, v.Findings[j].Socket
-		if (a.State == procnet.StateListen) != (b.State == procnet.StateListen) {
-			return a.State == procnet.StateListen
-		}
-		if a.Local.IP != b.Local.IP {
-			return a.Local.IP.Less(b.Local.IP)
-		}
-		return a.State < b.State
-	})
+	sortFindings(v.Findings)
 
 	var unrecognised []procnet.State
 	v.Kind, unrecognised = classify(v.Findings)
@@ -272,34 +289,35 @@ func Explain(q Query, tables []procnet.Table, env Env) Verdict {
 		})
 	}
 
+	// The free case adds no reason here: "no row matches this address" is only
+	// true once the IPv6 wildcard question below has been answered.
 	switch v.Kind {
-	case KindFree:
-		// An IPv6 wildcard listener can also occupy IPv4, depending on
-		// net.ipv6.bindv6only. This version does not verify which, so it must
-		// not answer "free" — an unverified "free" is the one answer a
-		// diagnostic tool must never give.
-		if shadow := v6WildcardShadow(q, tables); shadow != nil {
-			v.Kind = KindUnknown
-			v.Findings = append(v.Findings, Finding{Socket: *shadow})
-			v.Reasons = append(v.Reasons, Reason{
-				Code:   ReasonV6Wildcard,
-				Detail: shadow.Local.String(),
-			})
-		} else if len(released) == 0 {
-			v.Reasons = append(v.Reasons, Reason{Code: ReasonNoSockets})
-		}
-		if v.Kind == KindFree {
-			// The one answer this blind spot can invalidate, so it is stated
-			// here and nowhere else: a caveat that appears on every report stops
-			// being read.
-			v.Reasons = append(v.Reasons, Reason{Code: ReasonUnlistedBinding})
-		}
 	case KindListening:
 		v.Reasons = append(v.Reasons, Reason{Code: ReasonListener})
 	case KindTimeWaitOnly:
 		v.Reasons = append(v.Reasons, Reason{Code: ReasonTimeWait})
 	case KindOccupiedNonListening:
 		v.Reasons = append(v.Reasons, Reason{Code: ReasonOtherState})
+	}
+
+	// The IPv6 wildcard question is settled after the base classification,
+	// because its answer comes from a tunable and not from the rows: with
+	// bindv6only=1 the wildcard is irrelevant to an IPv4 address, with 0 it is a
+	// second holder, and "could not read it" is a hole that must outrank a free
+	// answer. Day 1 could only say unknown here; the measurement is what makes
+	// the other two answers legitimate.
+	if shadow := v6WildcardShadow(q, tables); shadow != nil {
+		v = foldV6Wildcard(v, *shadow, env)
+	}
+
+	if v.Kind == KindFree {
+		if len(released) == 0 {
+			v.Reasons = append(v.Reasons, Reason{Code: ReasonNoSockets})
+		}
+		// The one answer this blind spot can invalidate, so it is stated here
+		// and nowhere else: a caveat that appears on every report stops being
+		// read.
+		v.Reasons = append(v.Reasons, Reason{Code: ReasonUnlistedBinding})
 	}
 
 	if len(released) > 0 {
@@ -336,6 +354,73 @@ func Explain(q Query, tables []procnet.Table, env Env) Verdict {
 	return applyProbe(v, env.Probe)
 }
 
+// foldV6Wildcard settles whether an IPv6 wildcard listener also holds the
+// queried IPv4 address, using the one measurement that can answer it.
+//
+// The three outcomes are not symmetrical and must not be made to look alike:
+//
+//   - unreadable: nothing was measured, so the answer cannot be "free" — and it
+//     is not "unknown" either when an IPv4 listener already settles the question,
+//     because a listener blocks regardless of any tunable.
+//   - dual-stack (0): the wildcard holds IPv4 too. The row joins the findings,
+//     with its owners, because "which process" is the next question and this row
+//     is the answer to it.
+//   - IPv6 only (1): the wildcard is irrelevant here, the base classification
+//     stands, and the measurement is still printed — a number a report uses has
+//     to be visible, or the reader cannot check it.
+func foldV6Wildcard(v Verdict, shadow procnet.Socket, env Env) Verdict {
+	switch {
+	case !env.V6Only.Known():
+		v.Reasons = append(v.Reasons, Reason{
+			Code:   ReasonV6Wildcard,
+			Detail: fmt.Sprintf("%s is a listening %s wildcard on this port; %s", shadow.Local, shadow.Family, env.V6Only.Describe()),
+		})
+		if v.Kind != KindListening {
+			v.Kind = KindUnknown
+		}
+	case env.V6Only.DualStack():
+		f := Finding{Socket: shadow}
+		if env.Lookup != nil {
+			f.Owners = prepareOwners(env.Lookup(shadow), env.PPID)
+		}
+		v.Findings = append(v.Findings, f)
+		sortFindings(v.Findings)
+		v.Kind = KindListening
+		v.Reasons = append(v.Reasons,
+			Reason{
+				Code:   ReasonV6Shadow,
+				Detail: fmt.Sprintf("%s also holds this address; %s", shadow.Local, env.V6Only.Describe()),
+			},
+			Reason{
+				Code:   ReasonV6PerSocket,
+				Detail: "bindv6only is the default for new sockets; a listener that set IPV6_V6ONLY=1 for itself would leave IPv4 free, and only a bind attempt can tell",
+			},
+		)
+	default:
+		v.Reasons = append(v.Reasons, Reason{
+			Code:   ReasonV6NoShadow,
+			Detail: fmt.Sprintf("%s does not hold this address; %s", shadow.Local, env.V6Only.Describe()),
+		})
+	}
+	return v
+}
+
+// sortFindings is the reporting order: listeners first, then by address, then by
+// state. Every caller that adds a finding has to come through here, or the row
+// order starts depending on which branch appended last.
+func sortFindings(findings []Finding) {
+	sort.SliceStable(findings, func(i, j int) bool {
+		a, b := findings[i].Socket, findings[j].Socket
+		if (a.State == procnet.StateListen) != (b.State == procnet.StateListen) {
+			return a.State == procnet.StateListen
+		}
+		if a.Local.IP != b.Local.IP {
+			return a.Local.IP.Less(b.Local.IP)
+		}
+		return a.State < b.State
+	})
+}
+
 // applyProbe folds the empirical evidence into the table-based answer.
 //
 // One direction only: a probe may make the answer more cautious, never more
@@ -354,7 +439,21 @@ func applyProbe(v Verdict, evidence []probe.Attempt) Verdict {
 		// apart.
 		v.dropReason(ReasonUnlistedBinding)
 	}
+	if plainRefused(evidence) {
+		// This caveat doubted whether the port can be bound at all; a refused
+		// plain bind has just measured that it cannot. Leaving it in place would
+		// tell a reader to go try something the tool already tried.
+		v.dropReason(ReasonV6PerSocket)
+	}
 	return v
+}
+
+// plainRefused reports whether a plain bind was really refused with EADDRINUSE.
+// Only that answer contradicts the per-socket v6 caveat: EACCES and a failed
+// attempt contradict nothing.
+func plainRefused(evidence []probe.Attempt) bool {
+	plain, _ := byMode(evidence)
+	return plain != nil && plain.Trustworthy() && plain.Outcome == probe.OutcomeAddrInUse
 }
 
 func foldProbe(v Verdict, evidence []probe.Attempt) Verdict {
@@ -652,14 +751,20 @@ func occupies(s procnet.Socket, q Query) bool {
 //
 // Getting this wrong in the loose direction reports a conflict that does not
 // exist, and users stop believing the tool after one such report.
+//
+// Both sides are unmapped first. A row in tcp6 holding ::ffff:127.0.0.1 is an
+// IPv4 socket as far as the kernel is concerned — it is the same binding table
+// entry, and a bind to 127.0.0.1 on that port fails. Comparing it as IPv6 would
+// answer "free" about a port that plainly is not.
 func addressCovers(held, want procnet.Addr) bool {
-	if !sameFamily(held.IP, want.IP) {
+	h, w := held.IP.Unmap(), want.IP.Unmap()
+	if !sameFamily(h, w) {
 		return false
 	}
-	if held.IsWildcard() || want.IsWildcard() {
+	if h.IsUnspecified() || w.IsUnspecified() {
 		return true
 	}
-	return held.IP == want.IP
+	return h == w
 }
 
 func sameFamily(a, b netip.Addr) bool {
