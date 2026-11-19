@@ -91,6 +91,54 @@ Three properties make that safe to run against a service you care about:
   thing a successful bind subtracts is the `bind-without-listen` caveat it has
   just disproved at that instant.
 
+## The one question one tunable answers
+
+`[::]:8080` on its own decides nothing: whether it also holds `127.0.0.1:8080`
+is `net.ipv6.bindv6only`, and no socket table reports it. This version reads the
+tunable and prints what it found:
+
+```
+$ portwhy why 127.0.0.1:18080
+127.0.0.1:18080/tcp — a listening socket holds it
+
+holders
+  LISTEN         [::]:18080             pid 170 (server) fd 4 [sole]     inode 42451711
+
+why
+  - the IPv6 wildcard listener holds this IPv4 address too: this host runs with
+    bindv6only=0, so a [::] socket is dual-stack ([::]:18080;
+    net.ipv6.bindv6only = 0, read from /proc/sys/net/ipv6/bindv6only)
+
+limits
+  - bindv6only is the default for new sockets, not a property of an existing one:
+    a listener that set IPV6_V6ONLY for itself would leave IPv4 free, and only
+    -probe can tell which
+```
+
+On a host with `bindv6only=1` the same row is not a holder at all, and the answer
+returns to `free` — quoting `= 1` and the file it came from, so the number can be
+checked instead of trusted. When the tunable cannot be read (no IPv6, a hidden
+mount, a file that does not contain `0` or `1`), the answer stays `unknown`: a
+default is not a measurement.
+
+The `limits` line above is not decoration. That particular blind spot — a socket
+that opted out of dual-stack for itself — is real, and `--probe` is what settles
+it:
+
+```
+$ portwhy why 127.0.0.1:18082 --probe     # [::] bound as tcp6, so V6ONLY for that socket
+127.0.0.1:18082/tcp — cannot be determined from what was readable
+
+why
+  - the wildcard looked dual-stack but a bind succeeded: that listener is
+    IPv6-only for itself, an option the kernel reports nowhere, so this version
+    does not promote the answer to free (a plain bind succeeded at
+    2026-11-19T12:41:45Z although [::]:18082 is listening on this port)
+```
+
+Exit 3, not 0: the port is bindable at that instant, and "bindable now" is not
+what `free` means here.
+
 ## Why another one
 
 `ss` and `lsof` list sockets. They do not answer the question people actually
@@ -101,7 +149,7 @@ have, which is *which of the four different things* is wrong:
 | a listener on the same address | a process is serving there | stop it, or use another port |
 | only `TIME_WAIT` rows | a closed connection still reserves the port | a socket option, or wait out 2×MSL |
 | a listener on `0.0.0.0` while you asked for one interface | the wildcard covers you | same as the first row |
-| a listener on `[::]` while you asked for IPv4 | maybe: it depends on `net.ipv6.bindv6only` | verified, not assumed |
+| a listener on `[::]` while you asked for IPv4 | it depends on `net.ipv6.bindv6only` | measured per host, not assumed |
 
 The fourth row is why this tool exists. Most advice on the internet collapses all
 of these into "kill the process or set `SO_REUSEADDR`", and part of that advice is
@@ -144,6 +192,7 @@ portwhy version
 | `-probe` | attempt a real `bind()` twice — plain, then `SO_REUSEADDR` — and report what the kernel answered. Never calls `listen()`. tcp only |
 | `-no-holders` | skip the `/proc/<pid>/fd` walk: kernel state only |
 | `-tables DIR` | read the socket tables from DIR instead of `/proc/net` |
+| `-sysctl DIR` | read `net/ipv6/bindv6only` from DIR instead of `/proc/sys` (the only tunable this tool reads) |
 | `-proc ROOT` | use ROOT instead of `/proc` when naming the holder |
 
 `:8080` means every interface (`0.0.0.0:8080`). `[::1]:8080` is IPv6.
@@ -194,10 +243,12 @@ Written down because the boundary is the product:
   appears in no `/proc/net` table, because those tables only iterate the connection
   and listener hashes. So a `free` answer always carries that caveat. `--probe` is
   what closes the gap, and it closes it only for the instant it ran.
-- **It does not resolve `net.ipv6.bindv6only` yet.** A `[::]` listener on the queried
-  port still forces `unknown`, even with `--probe`: a successful IPv4 `bind()` shows
-  that IPv4 was free, but this version has no model for the shadow question, so it
-  does not upgrade the answer. Measuring the flag is the next capability.
+- **It cannot see a socket that opted out of dual-stack.** `bindv6only` is the
+  default for new sockets; a program may call `setsockopt(IPV6_V6ONLY, 1)` for
+  itself, and the kernel publishes no column for it. So when a `[::]` listener is
+  the only evidence, the report adds that limit instead of presenting the shadow
+  as certain, and `--probe` is what settles it — a bind that succeeds there turns
+  the answer into `unknown` with that explanation, not into `free`.
 - **It refuses addresses it cannot express.** A scoped IPv6 address (`[fe80::1%eth0]`)
   is rejected rather than approximated, because resolving a zone name to an index
   needs a dependency this project does not take.
@@ -212,6 +263,7 @@ Written down because the boundary is the product:
 
 ```
 /proc/net/tcp{,6}, /proc/net/udp{,6}   → internal/procnet   rows, addresses, states
+/proc/sys/net/ipv6/bindv6only          → internal/sysctl    does [::] also hold IPv4
 /proc/<pid>/fd/* → "socket:[inode]"    → internal/sockid    who holds which inode
 bind() twice, never listen()           → internal/probe     what the kernel does now
                         ↓
@@ -220,9 +272,9 @@ bind() twice, never listen()           → internal/probe     what the kernel do
                   cmd/portwhy           text / JSON, exit codes
 ```
 
-Only `internal/procnet`, `internal/sockid` and `internal/probe` touch the system;
-`internal/verdict` is a pure function over rows and injected evidence, which is
-why the four causes above — and every way the probe can contradict them — can be
-tested without opening a socket. See [docs/design.md](docs/design.md) for the
-decisions behind that split and the cases this version deliberately refuses to
-answer.
+Only `internal/procnet`, `internal/sysctl`, `internal/sockid` and `internal/probe`
+touch the system; `internal/verdict` is a pure function over rows and injected
+evidence, which is why the four causes above — and every way the probe or the
+tunable can contradict them — can be tested without opening a socket. See
+[docs/design.md](docs/design.md) for the decisions behind that split and the cases
+this version deliberately refuses to answer.

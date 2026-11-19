@@ -10,7 +10,8 @@ as for the ones it gives.
 
 1. A process is listening on that exact address.
 2. A process is listening on a wildcard that covers that address
-   (`0.0.0.0`, or `[::]` depending on `net.ipv6.bindv6only`).
+   (`0.0.0.0`, or `[::]` depending on `net.ipv6.bindv6only` — which this version
+   measures instead of guessing).
 3. Nothing is listening, and the address is reserved by a `TIME_WAIT` row left
    by a closed connection.
 4. A socket holds the address in a non-listening state (`ESTABLISHED`,
@@ -29,7 +30,7 @@ every week.
 | `listening` | a row in `LISTEN` whose local address covers the query | nothing: the row is the state |
 | `time-wait-only` | rows in `TIME_WAIT` and nothing else | a non-`TIME_WAIT` row in an unread table |
 | `occupied-non-listening` | rows in another bound state | whether the bind actually fails: it may not, if `SO_REUSEADDR`/`SO_REUSEPORT` is set. Without a probe this version reports the occupation and says the consequence is unverified; with `--probe` the consequence is measured, and a successful bind becomes a conflict rather than a quiet contradiction |
-| `unknown` | a table that should exist could not be read, or an IPv6 wildcard may be shadowing IPv4 | nothing: `unknown` is the honest floor |
+| `unknown` | a table that should exist could not be read, or an IPv6 wildcard may be shadowing IPv4 and `bindv6only` could not be read | nothing: `unknown` is the honest floor |
 
 The `free` row carries the risk. It is the only kind that tells a user "go
 ahead", so every hole in the evidence must collapse it into `unknown` first.
@@ -75,6 +76,43 @@ Nothing enters the `free` column from any row that was not already `free`. That 
 what keeps the probe from becoming a second opinion that can be talked into a
 reassuring answer.
 
+### The IPv6 wildcard: one tunable, three answers
+
+Day 1 answered this shape with `unknown` and said why: whether `[::]` also holds an
+IPv4 address is `net.ipv6.bindv6only`, `/proc/net` does not report it, and an
+unverified `free` is the one answer this tool must never give. The fix was not to
+model the question better but to measure the input, the same way the probe is an
+input: `internal/sysctl` reads the file, `Env.V6Only` carries the value, and the
+judgement stays a pure function.
+
+| measured | what it means here | kind |
+|---|---|---|
+| `0` | a `[::]` socket is dual-stack by default, so the wildcard holds the IPv4 address too | `listening`, row added with owners, plus the per-socket limit |
+| `1` | `[::]` is IPv6 only; the IPv4 address is untouched | the base classification stands, and the value is printed |
+| unreadable | nothing was measured | `unknown` — unless an IPv4 listener already settles it, in which case the listener wins |
+
+Three details are deliberate:
+
+- **The value is always printed with its source file.** A number a verdict rests
+  on has to be checkable, and "bindv6only" without a value is the folklore this
+  tool replaces.
+- **`unknown` outranks `free` but not a known listener.** If an IPv4 listener is
+  in the table, the question about a tunable does not matter: a listener blocks
+  regardless. Downgrading that to `unknown` would trade a fact for a gap.
+- **The per-socket limit travels with the shadow claim.** `bindv6only` is the
+  default for new sockets; a program can call `setsockopt(IPV6_V6ONLY, 1)` for
+  itself and the kernel exposes no column for it. So the shadow is reported as
+  "true unless that socket opted out", and `--probe` is named as the way to settle
+  it. A refused plain bind removes the limit; a successful one replaces the whole
+  claim with the opt-out diagnosis (`ipv6-wildcard-turned-out-ipv6-only`) rather
+  than blaming a stale table, because both observations describe the same instant.
+
+Address comparison follows `bind()` rather than the string form: both sides are
+`Unmap()`ed first, so a `tcp6` row holding `::ffff:127.0.0.1` is compared as the
+IPv4 address it is, and a specific `[::1]` never covers `127.0.0.1` in any setting.
+Getting the first one wrong answers `free` about a port that is plainly taken;
+getting the second one wrong invents a conflict that does not exist.
+
 ## 3. Capability boundary
 
 ### What the data sources can prove
@@ -103,10 +141,11 @@ reassuring answer.
   This tool does not claim otherwise anywhere in its output.
 - **The age of a socket.** The kernel does not expose when a `TIME_WAIT` row was
   created, so "released in 43 s" would be a fabrication. Refused.
-- **Whether `[::]` occupies IPv4.** It depends on `net.ipv6.bindv6only`, which
-  `/proc/net` does not report. Until a probe settles it, a `[::]` listener on
-  the queried port turns `free` into `unknown` — it never silently shadows, and
-  it never silently allows.
+- **Whether `[::]` occupies IPv4, in general.** The machine-wide default is
+  readable and now read, so this tool can answer it for an ordinary listener. What
+  remains unknowable is the per-socket case: `setsockopt(IPV6_V6ONLY)` is not in
+  any table. The report states that limit next to the claim, and `--probe` is the
+  only thing that settles it.
 - **Why a specific `bind()` failed.** `EACCES` (privileged port), `EADDRNOTAVAIL`
   (address not on any interface) and `EADDRINUSE` are three different errors that
   arrive as the same failure to a user. Tables can only classify the address; with
@@ -140,9 +179,10 @@ reassuring answer.
 
 ```
 internal/procnet   files → []Socket          (pure over an io.Reader)
+internal/sysctl    tunables → measured value (0, 1, or unreadable)
 internal/sockid    inodes → holders          (the only /proc/<pid> walker)
 internal/probe     address → []Attempt       (real bind(); never listen())
-internal/verdict   []Socket + attempts → Kind (pure; evidence is an argument)
+internal/verdict   []Socket + evidence → Kind (pure; evidence is an argument)
 cmd/portwhy        rendering, exit codes
 ```
 
@@ -168,7 +208,17 @@ Each of these is a test today, and each is a way the tool could become harmful:
 - A `TIME_WAIT` row must not be reported as a listener: the fixes differ.
 - A `TIME_WAIT` row must never be given an owner.
 - An unreadable table must produce exit 3, never exit 0.
-- A `[::]` listener on the port must produce `unknown`, never `free`.
+- A `[::]` listener on the port must produce `unknown`, never `free`, when
+  `bindv6only` could not be read. With `bindv6only=1` the same row must not be a
+  holder at all; with `0` it must be one — and in both cases the measured value and
+  its source file must be printed.
+- A specific `[::1]` listener must never be reported for `127.0.0.1`, whatever
+  `bindv6only` says.
+- A successful bind on a port whose only evidence was a shadow must replace that
+  claim with the per-socket opt-out diagnosis. Two contradictory sentences in one
+  report are worse than a gap.
+- The zero value of the measured tunable must never read as `0`: a caller that
+  forgot to measure has to land on `unknown`.
 - An IPv4-mapped target (`[::ffff:127.0.0.1]:8080`) must be compared as IPv4,
   or the answer is `free` for a port that is plainly taken.
 - An unrecognised state code must produce `unknown`, never `occupied` and never
@@ -202,15 +252,19 @@ instant of each attempt. Two rather than four, on purpose:
 - `SO_REUSEPORT` is not attempted. Joining an existing listener's group can steal
   a connection for the duration of the probe, and that is a side effect this
   version is not willing to cause silently.
-- An IPv6-only attempt is not made. Whether `[::]` shadows IPv4 depends on
-  `net.ipv6.bindv6only`, so the fix is to measure that flag, not to add a fourth
-  attempt whose result would need the same interpretation.
+- An IPv6-only attempt is not made. Whether `[::]` shadows IPv4 is answered by
+  reading `net.ipv6.bindv6only`, and a fourth attempt would only measure the one
+  case the tunable cannot describe (a socket that opted out) — which the shadow
+  claim already names as its limit and which any plain bind on the IPv4 address
+  settles for free.
 
 What the two attempts settle today: whether a `TIME_WAIT` row blocks a plain bind
-here, whether the option unblocks it, and which errno a bind really returns. What
-they do not settle: the IPv6 shadow question, and anything about a `bind()` that
-happens after the probe — which is why the report prints the instant instead of a
-verdict about the future.
+here, whether the option unblocks it, and which errno a bind really returns. Since
+Day 4 they also settle the per-socket IPv6 question, asymmetrically: a bind that
+succeeds proves the wildcard opted out, while a bind refused with `EADDRINUSE`
+proves only that something holds the address — not that the wildcard does. What
+they do not settle: anything about a `bind()` that happens after the probe — which
+is why the report prints the instant instead of a verdict about the future.
 
 Two rules for this work, decided before it was written so they were not decided
 under pressure:
