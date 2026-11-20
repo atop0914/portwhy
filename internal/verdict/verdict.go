@@ -92,6 +92,28 @@ const (
 	// invalidate.
 	ReasonUnlistedBinding = "bind-without-listen-not-listed"
 
+	// Ephemeral-range reason codes. These are about a different question from
+	// the rest of this file: not "who holds it now" but "was this port ever a
+	// place a long-lived listener could stay". A port inside
+	// net.ipv4.ip_local_port_range can be handed out by the kernel as the source
+	// port of an outbound connection, which is why the same fixed port works
+	// most days and fails on the others. None of these codes may change the
+	// kind: a free port inside the ephemeral range is still free, and turning
+	// "occasionally taken" into "taken" would be the false positive that makes
+	// this tool useless.
+	//
+	// ReasonEphemeralRange is the risk: measured inside the range, and not
+	// carved out by the reservation list.
+	ReasonEphemeralRange = "port-in-ephemeral-range"
+	// ReasonEphemeralReserved is the good news: the port is listed in
+	// net.ipv4.ip_local_reserved_ports, so the kernel will not hand it out.
+	ReasonEphemeralReserved = "port-reserved-from-ephemeral"
+	// ReasonEphemeralUnreadable is the hole: the range could not be read, so
+	// whether the kernel could take this port was never measured. It is stated
+	// on free answers only — everywhere else the diagnosis already answers the
+	// question the reader came with.
+	ReasonEphemeralUnreadable = "ephemeral-range-unreadable"
+
 	// Probe reason codes. The probe is the only evidence that can contradict a
 	// table, so each way the two can disagree has its own code: folding them
 	// together would make "the table is stale" and "the table cannot see this
@@ -182,6 +204,14 @@ type Env struct {
 	// 0". The zero value means nobody measured, and that is answered with
 	// unknown rather than with the value Linux usually has.
 	V6Only sysctl.BindV6Only
+	// Ephemeral is what net.ipv4.ip_local_port_range measured. It never changes
+	// the kind: being inside the pool is a reason this port is a bad place for a
+	// long-lived listener, not a reason it is taken.
+	Ephemeral sysctl.PortRange
+	// Reserved is what net.ipv4.ip_local_reserved_ports measured. Its three
+	// states — measured, unreadable, absent — all mean something different, and
+	// none of them may be read as "reserved" or as "not reserved" on a guess.
+	Reserved sysctl.ReservedPorts
 }
 
 // Verdict is the answer plus the evidence it rests on.
@@ -208,6 +238,12 @@ type Verdict struct {
 	// or not it changed anything: a report that cites a tunable has to be able
 	// to show what it read.
 	V6Only sysctl.BindV6Only
+	// Ephemeral and Reserved are the two port-pool measurements this answer was
+	// allowed to use, recorded for the same reason as V6Only: a report that says
+	// "your port is inside 32768-60999" has to be able to show where that
+	// interval came from, including when the answer is "I could not read it".
+	Ephemeral sysctl.PortRange
+	Reserved  sysctl.ReservedPorts
 }
 
 // Explain classifies one address.
@@ -215,7 +251,14 @@ type Verdict struct {
 // The order of the checks is the honesty of the result: an unreadable table is
 // settled first, so that no later branch can turn a blind spot into "free".
 func Explain(q Query, tables []procnet.Table, env Env) Verdict {
-	v := Verdict{Query: q, ProcsRead: env.ProcsRead, ProcsDenied: env.ProcsDenied, V6Only: env.V6Only}
+	v := Verdict{
+		Query:       q,
+		ProcsRead:   env.ProcsRead,
+		ProcsDenied: env.ProcsDenied,
+		V6Only:      env.V6Only,
+		Ephemeral:   env.Ephemeral,
+		Reserved:    env.Reserved,
+	}
 
 	var relevant []procnet.Table
 	for _, t := range tables {
@@ -330,6 +373,8 @@ func Explain(q Query, tables []procnet.Table, env Env) Verdict {
 		v.Reasons = append(v.Reasons, Reason{Code: ReasonTeardown, Detail: teardownDetail(released)})
 	}
 
+	v = applyEphemeral(v, env)
+
 	// A row with inode 0 has no file descriptor behind it — a TIME_WAIT row, or a
 	// socket we closed that is still waiting out its timeout — so no amount of
 	// /proc walking will name an owner. Saying that out loud stops the next
@@ -422,6 +467,74 @@ func sortFindings(findings []Finding) {
 		}
 		return a.State < b.State
 	})
+}
+
+// applyEphemeral adds what the port-pool tunables say about this port.
+//
+// It is deliberately the weakest layer in this file: it can add a risk and it
+// can add good news, and it cannot move the kind by one value. A port inside the
+// ephemeral range is why the same fixed port binds on most days and fails on the
+// others; a report that called that "taken" would turn a one-in-fifty event into
+// a permanent false positive, and a diagnostic tool that cries wolf is worse than
+// none.
+//
+// The three outcomes are not symmetrical:
+//
+//   - unreadable range: the one answer this hole can invalidate is "free",
+//     because "nothing can take this port" is part of what free means here. It is
+//     stated there and nowhere else.
+//   - reserved: the kernel was told never to hand this port out. That is the
+//     risk removed, and it is worth printing — it is the fix someone already
+//     applied.
+//   - in range and not reserved: the risk, with the interval and the file it
+//     came from. If the reservation list could not be read, that goes in the
+//     same sentence: "not excluded" would be a check nobody ran.
+func applyEphemeral(v Verdict, env Env) Verdict {
+	port := v.Query.Addr.Port
+	// Port 0 is not a port: it is "pick one for me", answered by the very pool
+	// this check is about. Reporting a risk against it would be advice about a
+	// port the user never named.
+	if port == 0 {
+		return v
+	}
+
+	if !env.Ephemeral.Known() {
+		if v.Kind == KindFree {
+			v.Reasons = append(v.Reasons, Reason{
+				Code: ReasonEphemeralUnreadable,
+				Detail: env.Ephemeral.Describe() + "; whether the kernel could take this port for an " +
+					"outbound connection was not measured",
+			})
+		}
+		return v
+	}
+
+	if !env.Ephemeral.Contains(port) {
+		// The reverse assertion that keeps the report quiet: a port outside the
+		// pool says nothing about the pool.
+		return v
+	}
+
+	if env.Reserved.Contains(port) {
+		v.Reasons = append(v.Reasons, Reason{
+			Code: ReasonEphemeralReserved,
+			Detail: fmt.Sprintf("%d is listed in net.ipv4.ip_local_reserved_ports, so it is excluded from "+
+				"the ephemeral range %d-%d (%s): the kernel will not hand it out as an outbound source port",
+				port, env.Ephemeral.Low, env.Ephemeral.High, env.Ephemeral.Path),
+		})
+		return v
+	}
+
+	detail := fmt.Sprintf("%d is inside the ephemeral range %d-%d read from %s; the kernel may hand it out as "+
+		"the source port of an outbound connection, which is why a fixed listener here fails only sometimes",
+		port, env.Ephemeral.Low, env.Ephemeral.High, env.Ephemeral.Path)
+	if env.Reserved.Known() {
+		detail += "; net.ipv4.ip_local_reserved_ports does not exclude it"
+	} else {
+		detail += "; whether it is excluded from that pool could not be read: " + env.Reserved.Describe()
+	}
+	v.Reasons = append(v.Reasons, Reason{Code: ReasonEphemeralRange, Detail: detail})
+	return v
 }
 
 // applyProbe folds the empirical evidence into the table-based answer.
