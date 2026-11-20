@@ -501,10 +501,12 @@ func applyEphemeral(v Verdict, env Env) Verdict {
 
 	if !env.Ephemeral.Known() {
 		if v.Kind == KindFree {
+			// The detail is the measurement that failed, not what it means: the
+			// sentence this code renders to already carries that. Two
+			// near-identical halves in one line read as two separate findings.
 			v.Reasons = append(v.Reasons, Reason{
-				Code: ReasonEphemeralUnreadable,
-				Detail: env.Ephemeral.Describe() + "; whether the kernel could take this port for an " +
-					"outbound connection was not measured",
+				Code:   ReasonEphemeralUnreadable,
+				Detail: env.Ephemeral.Describe(),
 			})
 		}
 		return v
@@ -517,21 +519,26 @@ func applyEphemeral(v Verdict, env Env) Verdict {
 	}
 
 	if env.Reserved.Contains(port) {
+		// The evidence only: which file lists it, and which interval it was
+		// excluded from. The sentence says what that means.
 		v.Reasons = append(v.Reasons, Reason{
 			Code: ReasonEphemeralReserved,
-			Detail: fmt.Sprintf("%d is listed in net.ipv4.ip_local_reserved_ports, so it is excluded from "+
-				"the ephemeral range %d-%d (%s): the kernel will not hand it out as an outbound source port",
-				port, env.Ephemeral.Low, env.Ephemeral.High, env.Ephemeral.Path),
+			Detail: fmt.Sprintf("%d is listed in %s; the ephemeral range this host measured is %d-%d (%s)",
+				port, env.Reserved.Path, env.Ephemeral.Low, env.Ephemeral.High, env.Ephemeral.Path),
 		})
 		return v
 	}
 
-	detail := fmt.Sprintf("%d is inside the ephemeral range %d-%d read from %s; the kernel may hand it out as "+
-		"the source port of an outbound connection, which is why a fixed listener here fails only sometimes",
-		port, env.Ephemeral.Low, env.Ephemeral.High, env.Ephemeral.Path)
+	// Only the evidence goes here — the interval, the file it came from, and the
+	// reservation answer. The mechanism is the sentence this code renders to, and
+	// saying it twice on one line makes one fact look like two.
+	detail := fmt.Sprintf("%d is inside %d-%d read from %s", port, env.Ephemeral.Low, env.Ephemeral.High,
+		env.Ephemeral.Path)
 	if env.Reserved.Known() {
 		detail += "; net.ipv4.ip_local_reserved_ports does not exclude it"
 	} else {
+		// Not knowing whether it was carved out is part of the risk, not a
+		// footnote: claiming "not excluded" here would be a check nobody ran.
 		detail += "; whether it is excluded from that pool could not be read: " + env.Reserved.Describe()
 	}
 	v.Reasons = append(v.Reasons, Reason{Code: ReasonEphemeralRange, Detail: detail})

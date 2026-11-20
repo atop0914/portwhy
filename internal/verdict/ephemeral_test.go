@@ -68,7 +68,7 @@ func TestEphemeralRangeIsRiskAndStaysFree(t *testing.T) {
 	if !ok {
 		t.Fatal("missing port-in-ephemeral-range reason")
 	}
-	for _, want := range []string{"50000", "32768-60999", rangePath, "source port", "outbound"} {
+	for _, want := range []string{"50000", "32768-60999", rangePath, "inside", "does not exclude it"} {
 		if !strings.Contains(detail, want) {
 			t.Errorf("detail %q does not mention %q", detail, want)
 		}
@@ -120,7 +120,7 @@ func TestEphemeralReservedReplacesTheRisk(t *testing.T) {
 	if !ok {
 		t.Fatal("missing port-reserved-from-ephemeral reason")
 	}
-	for _, want := range []string{"50000", "excluded", "32768-60999"} {
+	for _, want := range []string{"50000", "listed", "32768-60999"} {
 		if !strings.Contains(detail, want) {
 			t.Errorf("detail %q does not mention %q", detail, want)
 		}

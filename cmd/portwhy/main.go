@@ -150,7 +150,18 @@ func runWhy(args []string, stdout, stderr io.Writer) int {
 	// the value Linux usually has.
 	measuredV6Only := sysctl.ReadBindV6Only(*sysctlDir)
 
-	env := verdict.Env{V6Only: measuredV6Only}
+	// The two port-pool tunables. They are read for every question, including
+	// the ones outside the pool: reading them is what lets the report say "your
+	// port is outside the range this host measured" instead of saying nothing,
+	// and a failed read has to be a stated hole rather than a silent silence.
+	measuredRange := sysctl.ReadPortRange(*sysctlDir)
+	measuredReserved := sysctl.ReadReservedPorts(*sysctlDir)
+
+	env := verdict.Env{
+		V6Only:    measuredV6Only,
+		Ephemeral: measuredRange,
+		Reserved:  measuredReserved,
+	}
 	if !*skipHolders {
 		idx, err := sockid.Scan(*procRoot)
 		if err != nil {
@@ -307,29 +318,32 @@ var kindSentence = map[verdict.Kind]string{
 }
 
 var reasonSentence = map[string]string{
-	verdict.ReasonNoSockets:       "no row in the read tables matches this address",
-	verdict.ReasonListener:        "bind() to an address a listener holds fails with EADDRINUSE",
-	verdict.ReasonTimeWait:        "the reservation belongs to a closed connection, not to a running process",
-	verdict.ReasonOtherState:      "a bound socket in a non-listening state holds this address; whether bind() fails depends on socket options",
-	verdict.ReasonTableUnreadable: "a socket table could not be read, so absence of a row proves nothing",
-	verdict.ReasonV6Wildcard:      "whether the IPv6 wildcard listener also holds this IPv4 address could not be answered: net.ipv6.bindv6only was not readable, and a default is not a measurement",
-	verdict.ReasonV6Shadow:        "the IPv6 wildcard listener holds this IPv4 address too: this host runs with bindv6only=0, so a [::] socket is dual-stack",
-	verdict.ReasonV6NoShadow:      "the IPv6 wildcard listener does not hold this IPv4 address: this host runs with bindv6only=1, so [::] is IPv6 only",
-	verdict.ReasonV6PerSocket:     "bindv6only is the default for new sockets, not a property of an existing one: a listener that set IPV6_V6ONLY for itself would leave IPv4 free, and only -probe can tell which",
-	verdict.ReasonV6OptOut:        "the wildcard looked dual-stack but a bind succeeded: that listener is IPv6-only for itself, an option the kernel reports nowhere, so this version does not promote the answer to free",
-	verdict.ReasonNoOwnerInode:    "a row with inode 0 has no descriptor behind it (TIME_WAIT, or a socket closed and waiting out its timeout), so no process can be named for it",
-	verdict.ReasonProcsDenied:     "some processes could not be read, so an unnamed holder may exist",
-	verdict.ReasonProbeNotRun:     "no bind was attempted: this verdict comes from kernel state only",
-	verdict.ReasonTeardown:        "rows on this address belong to sockets the kernel is already destroying, so they do not hold the port",
-	verdict.ReasonUnknownState:    "a row used a state code this build does not know, so what it does to a bind cannot be stated",
-	verdict.ReasonUnlistedBinding: "a socket bound without listen() holds the port and has no row in these tables, so this answer cannot rule that out",
-	verdict.ReasonProbeBound:      "a plain bind succeeded, so the tables' silence was accurate at that instant and nothing — including a socket bound without listen() — held the address",
-	verdict.ReasonProbeRefused:    "a plain bind was refused: something holds this address",
-	verdict.ReasonProbeHolds:      "a plain bind was refused while no row covers the address: something bound this port without listen(), and no table lists it",
-	verdict.ReasonProbeOption:     "SO_REUSEADDR is what unblocks it — both attempts were made, and only the option one was accepted",
-	verdict.ReasonProbeDenied:     "the bind probe could not be made, so nothing was learned about the address — this is not a free port",
-	verdict.ReasonProbeGap:        "the probe evidence lacks the plain attempt that any conclusion about binding needs",
-	verdict.ReasonProbeConflict:   "the tables and the probe describe different instants, and this version cannot say which one you are facing",
+	verdict.ReasonNoSockets:           "no row in the read tables matches this address",
+	verdict.ReasonListener:            "bind() to an address a listener holds fails with EADDRINUSE",
+	verdict.ReasonTimeWait:            "the reservation belongs to a closed connection, not to a running process",
+	verdict.ReasonOtherState:          "a bound socket in a non-listening state holds this address; whether bind() fails depends on socket options",
+	verdict.ReasonTableUnreadable:     "a socket table could not be read, so absence of a row proves nothing",
+	verdict.ReasonV6Wildcard:          "whether the IPv6 wildcard listener also holds this IPv4 address could not be answered: net.ipv6.bindv6only was not readable, and a default is not a measurement",
+	verdict.ReasonV6Shadow:            "the IPv6 wildcard listener holds this IPv4 address too: this host runs with bindv6only=0, so a [::] socket is dual-stack",
+	verdict.ReasonV6NoShadow:          "the IPv6 wildcard listener does not hold this IPv4 address: this host runs with bindv6only=1, so [::] is IPv6 only",
+	verdict.ReasonV6PerSocket:         "bindv6only is the default for new sockets, not a property of an existing one: a listener that set IPV6_V6ONLY for itself would leave IPv4 free, and only -probe can tell which",
+	verdict.ReasonV6OptOut:            "the wildcard looked dual-stack but a bind succeeded: that listener is IPv6-only for itself, an option the kernel reports nowhere, so this version does not promote the answer to free",
+	verdict.ReasonNoOwnerInode:        "a row with inode 0 has no descriptor behind it (TIME_WAIT, or a socket closed and waiting out its timeout), so no process can be named for it",
+	verdict.ReasonProcsDenied:         "some processes could not be read, so an unnamed holder may exist",
+	verdict.ReasonProbeNotRun:         "no bind was attempted: this verdict comes from kernel state only",
+	verdict.ReasonTeardown:            "rows on this address belong to sockets the kernel is already destroying, so they do not hold the port",
+	verdict.ReasonUnknownState:        "a row used a state code this build does not know, so what it does to a bind cannot be stated",
+	verdict.ReasonUnlistedBinding:     "a socket bound without listen() holds the port and has no row in these tables, so this answer cannot rule that out",
+	verdict.ReasonEphemeralRange:      "this port is inside the kernel's ephemeral range: an outbound connection may take it as its source port, which is why a fixed listener here fails only sometimes — a port a long-lived service depends on belongs outside that range",
+	verdict.ReasonEphemeralReserved:   "this port is excluded from the ephemeral range: the kernel will not take it as an outbound source port, so the occasional EADDRINUSE from the pool cannot come from here",
+	verdict.ReasonEphemeralUnreadable: "the ephemeral range could not be read, so whether the kernel may take this port for an outbound connection was not measured — the range Linux usually has is not a measurement of this host",
+	verdict.ReasonProbeBound:          "a plain bind succeeded, so the tables' silence was accurate at that instant and nothing — including a socket bound without listen() — held the address",
+	verdict.ReasonProbeRefused:        "a plain bind was refused: something holds this address",
+	verdict.ReasonProbeHolds:          "a plain bind was refused while no row covers the address: something bound this port without listen(), and no table lists it",
+	verdict.ReasonProbeOption:         "SO_REUSEADDR is what unblocks it — both attempts were made, and only the option one was accepted",
+	verdict.ReasonProbeDenied:         "the bind probe could not be made, so nothing was learned about the address — this is not a free port",
+	verdict.ReasonProbeGap:            "the probe evidence lacks the plain attempt that any conclusion about binding needs",
+	verdict.ReasonProbeConflict:       "the tables and the probe describe different instants, and this version cannot say which one you are facing",
 }
 
 // limitReasons are the ones that describe what the answer does not cover. They
@@ -344,6 +358,9 @@ var limitReasons = map[string]bool{
 	verdict.ReasonV6Wildcard:      true,
 	verdict.ReasonV6PerSocket:     true,
 	verdict.ReasonUnlistedBinding: true,
+	// The pool range is a limit only when it could not be read; when it was
+	// read, the risk is part of the diagnosis and belongs in "why".
+	verdict.ReasonEphemeralUnreadable: true,
 }
 
 func renderText(w io.Writer, v verdict.Verdict) error {
@@ -648,6 +665,64 @@ type jsonEvidence struct {
 	// present, including when it could not be read: a consumer that only sees a
 	// value would never learn that the value was missing.
 	BindV6Only jsonBindV6Only `json:"bindv6only"`
+	// EphemeralRange and ReservedPorts are the port-pool evidence. They are
+	// always present for the same reason: "not read" has to be visible as such.
+	EphemeralRange jsonPortRange     `json:"ephemeral_range"`
+	ReservedPorts  jsonReservedPorts `json:"reserved_ports"`
+}
+
+// jsonPortRange has no zero value that reads as a measurement. Measured is the
+// switch and Low/High are pointers, so a failed read can never be decoded as the
+// interval 0-0 — which would claim every port on the host is outside the pool.
+type jsonPortRange struct {
+	Measured bool   `json:"measured"`
+	Low      *int   `json:"low,omitempty"`
+	High     *int   `json:"high,omitempty"`
+	Raw      string `json:"raw,omitempty"`
+	Path     string `json:"path"`
+	Error    string `json:"error,omitempty"`
+}
+
+// jsonReservedPorts keeps the three states apart with two switches rather than
+// one: Measured says the file was read (so Ports is authoritative, [] meaning
+// "none reserved"), Present says the tunable exists at all. Measured=false with
+// Present=false is a kernel without the tunable; Measured=false with
+// Present=true is a file that could not be understood.
+type jsonReservedPorts struct {
+	Measured bool     `json:"measured"`
+	Present  bool     `json:"present"`
+	Ports    []string `json:"ports"`
+	Raw      string   `json:"raw,omitempty"`
+	Path     string   `json:"path"`
+	Error    string   `json:"error,omitempty"`
+}
+
+func jsonPortRangeOf(p sysctl.PortRange) jsonPortRange {
+	out := jsonPortRange{Path: p.Path, Error: p.Err}
+	if p.Known() {
+		low, high := int(p.Low), int(p.High)
+		out.Measured = true
+		out.Low, out.High = &low, &high
+		out.Raw = strings.TrimSpace(p.Raw)
+	}
+	return out
+}
+
+func jsonReservedOf(r sysctl.ReservedPorts) jsonReservedPorts {
+	out := jsonReservedPorts{
+		Measured: r.Known(),
+		Present:  !r.Absent(),
+		Ports:    make([]string, 0, len(r.Intervals)),
+		Path:     r.Path,
+		Error:    r.Err,
+	}
+	for _, iv := range r.Intervals {
+		out.Ports = append(out.Ports, iv.String())
+	}
+	if r.Known() {
+		out.Raw = strings.TrimSpace(r.Raw)
+	}
+	return out
 }
 
 // jsonBindV6Only has no zero value that reads as a measurement. Measured is the
@@ -685,6 +760,8 @@ func renderJSON(w io.Writer, v verdict.Verdict) error {
 			ProcsRead:        v.ProcsRead,
 			ProcsDenied:      v.ProcsDenied,
 			BindV6Only:       jsonV6Only(v.V6Only),
+			EphemeralRange:   jsonPortRangeOf(v.Ephemeral),
+			ReservedPorts:    jsonReservedOf(v.Reserved),
 		},
 		Version: version.Resolve().Version,
 	}
@@ -774,9 +851,12 @@ flags for "why"
                    free, because a refused bind disproves that answer
   -no-holders      skip the /proc/<pid>/fd walk
   -tables DIR      kernel socket table directory (default %s)
-  -sysctl DIR      kernel tunable directory (default %s). Only
-                   net/ipv6.bindv6only is read, to answer whether a [::]
-                   listener also holds IPv4
+  -sysctl DIR      kernel tunable directory (default %s). Three are read:
+                   net/ipv6/bindv6only (does a [::] listener also hold IPv4),
+                   and net/ipv4/ip_local_port_range with
+                   net/ipv4/ip_local_reserved_ports (may the kernel hand this
+                   port out itself). A tunable that cannot be read is reported
+                   as a limit, never replaced by the usual value
   -proc ROOT       procfs root used to name holders (default %s)
 
 exit codes
