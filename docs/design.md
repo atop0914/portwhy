@@ -113,6 +113,55 @@ IPv4 address it is, and a specific `[::1]` never covers `127.0.0.1` in any setti
 Getting the first one wrong answers `free` about a port that is plainly taken;
 getting the second one wrong invents a conflict that does not exist.
 
+### The port pool: a risk, never a verdict
+
+Two tunables describe a port that is not held by anybody and still is a bad place
+for a long-lived listener:
+
+- `net.ipv4.ip_local_port_range` — the interval the kernel draws **outbound
+  connection source ports** from. A service bound inside it will eventually lose
+  the race to one of the machine's own connections.
+- `net.ipv4.ip_local_reserved_ports` — ports carved back out of that interval, so
+  the kernel never hands them out.
+
+This layer is deliberately the weakest in `internal/verdict`. It can add a risk
+(`port-in-ephemeral-range`) or good news (`port-reserved-from-ephemeral`), and it
+cannot move the kind by one value. A free port inside the pool is still `free`,
+with exit 0: the port is bindable *now*, and calling it `taken` would convert a
+one-in-fifty event into a permanent false positive — the failure mode that makes
+people stop running a diagnostic tool. The risk is a reason, and the diagnosis
+(the kind) stays the answer.
+
+The two facts are mutually exclusive in one report. "The kernel may take this
+port" and "the kernel will never take this port" cannot both be true, so a
+reserved port prints the second and drops the first.
+
+The measurement rules are the same as everywhere else in this project, with one
+addition: the range has a **widely known default** (`32768-60999`), and printing
+it for a host nobody read would be the most confidently wrong sentence this tool
+could emit. So a range is `Measured` or it is not, the zero value is not a range,
+and a range that cannot be read produces a limits line that contains no interval
+at all — asserted by searching the whole report for those two numbers.
+
+The reservation file has **three** states that must not be folded together:
+
+| state | meaning | what the report may say |
+|---|---|---|
+| read, empty | the kernel reserves nothing | the risk stands, and it was checked |
+| read, malformed | we do not know what it says | the risk stands, and the check did not happen |
+| file absent | this kernel has no such tunable (or the directory is not procfs) | the risk stands, and no reservation could be read |
+
+An empty file is a measurement; a missing file is not. Collapsing them would turn
+"I could not look" into "nothing is reserved", which is the same mistake as
+treating an unreadable socket table as an empty one.
+
+The interval is also not a claim about *this* instant. What it produces is a
+pattern: a `TIME_WAIT` row on a port inside the pool is the shape a client-side
+source port leaves behind, and it explains both "it failed this morning" and "it
+worked after a restart". The tables do not record which side opened a connection,
+so the report does not say so either — it states the interval, the file, and the
+mechanism.
+
 ## 3. Capability boundary
 
 ### What the data sources can prove
@@ -165,6 +214,17 @@ getting the second one wrong invents a conflict that does not exist.
   from the process tree, which proves descent and nothing else. When several
   holders are unrelated (systemd socket activation hands the listener to a service
   that is not its child), the report says `shared` and stops there.
+- **Which side of a connection a `TIME_WAIT` row came from.** The row records
+  local and remote addresses, not who initiated. A port inside the ephemeral pool
+  plus a `TIME_WAIT` row is consistent with a client-side source port, and that is
+  the most likely reading — but it is a pattern the tool reports, not a fact it
+  claims.
+- **When the kernel will next hand a specific port out.** The pool is an interval,
+  not a schedule. There is no table of "next allocations", so the risk is stated as
+  a risk. The one thing that was measured (`cmd/portwhy/ephemeral_linux_test.go`,
+  and the `srcconn` helper): the kernel does accept a chosen in-pool port as an
+  outbound source port, and while that connection lives `bind()` to it really does
+  fail with `EADDRINUSE`.
 
 ### Deliberately not done
 
@@ -179,7 +239,7 @@ getting the second one wrong invents a conflict that does not exist.
 
 ```
 internal/procnet   files → []Socket          (pure over an io.Reader)
-internal/sysctl    tunables → measured value (0, 1, or unreadable)
+internal/sysctl    tunables → measured value (0/1, an interval, or unreadable)
 internal/sockid    inodes → holders          (the only /proc/<pid> walker)
 internal/probe     address → []Attempt       (real bind(); never listen())
 internal/verdict   []Socket + evidence → Kind (pure; evidence is an argument)
@@ -243,6 +303,14 @@ Each of these is a test today, and each is a way the tool could become harmful:
   reported as "the option does not help here".
 - A probe result must carry the instant it was taken, in text and in JSON, and no
   output may offer a guarantee.
+- A port outside the measured ephemeral range must produce no statement about the
+  pool at all, and a port inside it must not change the kind or the exit code.
+- A range that could not be read must produce a limits line and no interval: the
+  report must not contain `32768` or `60999` unless the host really printed them.
+- An empty reservation file must not be reported as unreadable, and a missing one
+  must not be reported as "nothing is reserved".
+- A port 0 query must not produce a pool warning: port 0 is "pick one", which is
+  what the pool is for.
 
 ## 6. What the probe does, and what is still later
 

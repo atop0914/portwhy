@@ -139,6 +139,71 @@ why
 Exit 3, not 0: the port is bindable at that instant, and "bindable now" is not
 what `free` means here.
 
+## The port that fails one time in fifty
+
+A fixed port that binds every day, then one morning answers `EADDRINUSE` and
+works again after a restart, is usually not being held by anything. It sits
+inside `net.ipv4.ip_local_port_range`, the pool the kernel draws *outbound*
+connection source ports from — so every so often one of the machine's own
+connections takes the port first.
+
+```
+$ portwhy why 127.0.0.1:46883
+127.0.0.1:46883/tcp — nothing in the kernel tables occupies it
+
+why
+  - no row in the read tables matches this address
+  - this port is inside the kernel's ephemeral range: an outbound connection may
+    take it as its source port, which is why a fixed listener here fails only
+    sometimes — a port a long-lived service depends on belongs outside that range
+    (46883 is inside 32768-60999 read from /proc/sys/net/ipv4/ip_local_port_range;
+    net.ipv4.ip_local_reserved_ports does not exclude it)
+```
+
+The exit code is still 0 and the kind is still `free`. That is deliberate: this
+port is bindable right now, and turning "occasionally taken" into `taken` would
+be the false positive that kills a diagnostic tool. The risk is printed as a
+reason, not as a verdict, and the interval is printed with the file it came
+from.
+
+The mechanism is not folklore. While a connection from that port is open, a
+`bind()` to it really does fail:
+
+```
+outbound connection established from 127.0.0.1:46883
+while that connection is open, bind() to port 46883 returned: address already in use
+```
+
+and once the connection closes, the port is left in `TIME_WAIT` — which is why
+"restart and it works" is the usual experience. A host that has excluded the
+port from the pool says so instead:
+
+```
+  - this port is excluded from the ephemeral range: the kernel will not take it
+    as an outbound source port, so the occasional EADDRINUSE from the pool cannot
+    come from here (46883 is listed in /proc/sys/net/ipv4/ip_local_reserved_ports;
+    the ephemeral range this host measured is 32768-60999
+    (/proc/sys/net/ipv4/ip_local_port_range))
+```
+
+Both of those intervals are measurements. When the range cannot be read — a
+hidden mount, a file holding `abc`, a range that ends before it starts — the tool
+says so and prints no interval at all:
+
+```
+limits
+  - the ephemeral range could not be read, so whether the kernel may take this
+    port for an outbound connection was not measured — the range Linux usually
+    has is not a measurement of this host
+    (net.ipv4.ip_local_port_range is unreadable
+    (/proc/sys/net/ipv4/ip_local_port_range): "abc" is not two port numbers)
+```
+
+`32768-60999` appears nowhere in that output, on purpose: those numbers are the
+most common range, not this host's range, and a report that prints them for a
+host it never read is exactly the confident wrong answer this tool exists to
+replace.
+
 ## Why another one
 
 `ss` and `lsof` list sockets. They do not answer the question people actually
@@ -150,6 +215,7 @@ have, which is *which of the four different things* is wrong:
 | only `TIME_WAIT` rows | a closed connection still reserves the port | a socket option, or wait out 2×MSL |
 | a listener on `0.0.0.0` while you asked for one interface | the wildcard covers you | same as the first row |
 | a listener on `[::]` while you asked for IPv4 | it depends on `net.ipv6.bindv6only` | measured per host, not assumed |
+| nothing at all, but it fails now and then | the port is in the kernel's outbound source-port pool | pick a port outside that range |
 
 The fourth row is why this tool exists. Most advice on the internet collapses all
 of these into "kill the process or set `SO_REUSEADDR`", and part of that advice is
@@ -264,6 +330,8 @@ Written down because the boundary is the product:
 ```
 /proc/net/tcp{,6}, /proc/net/udp{,6}   → internal/procnet   rows, addresses, states
 /proc/sys/net/ipv6/bindv6only          → internal/sysctl    does [::] also hold IPv4
+/proc/sys/net/ipv4/ip_local_port_range → internal/sysctl    may the kernel take this port
+/proc/sys/net/ipv4/ip_local_reserved_ports                   ...and was it excluded
 /proc/<pid>/fd/* → "socket:[inode]"    → internal/sockid    who holds which inode
 bind() twice, never listen()           → internal/probe     what the kernel does now
                         ↓
