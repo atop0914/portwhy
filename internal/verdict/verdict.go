@@ -240,8 +240,9 @@ type Verdict struct {
 	V6Only sysctl.BindV6Only
 	// Ephemeral and Reserved are the two port-pool measurements this answer was
 	// allowed to use, recorded for the same reason as V6Only: a report that says
-	// "your port is inside 32768-60999" has to be able to show where that
-	// interval came from, including when the answer is "I could not read it".
+	// "your port sits inside the ephemeral pool" has to be able to show where
+	// that interval came from, including when the answer is "I could not read
+	// it".
 	Ephemeral sysctl.PortRange
 	Reserved  sysctl.ReservedPorts
 }
