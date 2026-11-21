@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/atop0914/portwhy/internal/netns"
 	"github.com/atop0914/portwhy/internal/probe"
 	"github.com/atop0914/portwhy/internal/procnet"
 	"github.com/atop0914/portwhy/internal/sysctl"
@@ -77,8 +78,18 @@ const (
 	// observations describe the same instant.
 	ReasonV6OptOut     = "ipv6-wildcard-turned-out-ipv6-only"
 	ReasonNoOwnerInode = "no-inode-so-no-owner"
-	ReasonProcsDenied  = "some-processes-unreadable"
-	ReasonProbeNotRun  = "bind-not-probed"
+	// ReasonProcsDenied is stated next to a finding whose holder could not be
+	// named: there is a socket, and the process behind it is invisible.
+	ReasonProcsDenied = "some-processes-unreadable"
+	ReasonProbeNotRun = "bind-not-probed"
+	// ReasonHolderLookupIncomplete is the same hole on the other kind of
+	// answer, and it is the more dangerous one: on a free answer there is no
+	// socket to point at, so a process that could not be read is a holder
+	// nobody looked for. The two codes are kept apart because their sentences
+	// differ — one says "the holder you can see has no name", the other says
+	// "this answer was not checked against every process".
+	ReasonHolderLookupIncomplete = "holder-lookup-incomplete"
+
 	// ReasonTeardown records rows that were seen on the address and discarded
 	// because the kernel had already released them. Silently dropping them
 	// would make the report disagree with the table a user is looking at.
@@ -113,6 +124,27 @@ const (
 	// on free answers only — everywhere else the diagnosis already answers the
 	// question the reader came with.
 	ReasonEphemeralUnreadable = "ephemeral-range-unreadable"
+
+	// Privileged-port reason codes. A third kind of question: not "who holds
+	// it" and not "will the kernel take it for itself", but "may this process
+	// bind it at all". A port below net.ipv4.ip_unprivileged_port_start is
+	// refused with EACCES before any address is considered, so neither "taken"
+	// nor "free" describes it — and a report that says free to a user who is
+	// about to get EACCES has sent them looking for a holder that does not
+	// exist.
+	//
+	// Neither code may change the kind or the exit code: like the pool risk,
+	// this is the scope of the answer, not a different answer.
+	//
+	// ReasonPrivilegedPort is the measured case, with the boundary and the file
+	// it came from. It is stated on free and unknown answers only: an answer
+	// that already names a holder, or that already says TIME_WAIT, has nothing
+	// to gain from a capability rule that is not what stopped the bind.
+	ReasonPrivilegedPort = "privileged-port-needs-root"
+	// ReasonPrivilegedUnreadable is the hole: the boundary could not be read, so
+	// whether this port needs root was never measured. Stated on free answers
+	// only, like every other limit that can only invalidate "go ahead".
+	ReasonPrivilegedUnreadable = "privileged-boundary-unreadable"
 
 	// Probe reason codes. The probe is the only evidence that can contradict a
 	// table, so each way the two can disagree has its own code: folding them
@@ -212,6 +244,16 @@ type Env struct {
 	// states — measured, unreadable, absent — all mean something different, and
 	// none of them may be read as "reserved" or as "not reserved" on a guess.
 	Reserved sysctl.ReservedPorts
+	// Privileged is what net.ipv4.ip_unprivileged_port_start measured: the
+	// lowest port this process may bind without a capability. It never changes
+	// the kind, for the same reason the pool range does not.
+	Privileged sysctl.PrivilegedPortStart
+	// NetNS is the network namespace this process runs in. It answers a
+	// question the tables cannot: every row here was read from one namespace,
+	// and a holder outside it is invisible. It never changes the kind — the
+	// answer is always about this namespace — but leaving it out of the report
+	// would make a scoped answer read as an absolute one.
+	NetNS netns.Identity
 }
 
 // Verdict is the answer plus the evidence it rests on.
@@ -245,6 +287,14 @@ type Verdict struct {
 	// it".
 	Ephemeral sysctl.PortRange
 	Reserved  sysctl.ReservedPorts
+	// Privileged is the capability boundary this answer was allowed to use,
+	// recorded whether or not it changed anything: a report that says "this
+	// port needs root" has to be able to show the number it compared against.
+	Privileged sysctl.PrivilegedPortStart
+	// NetNS is the namespace this answer is about, recorded for the same
+	// reason. An answer that does not name its scope invites the reader to
+	// apply it to a namespace it never looked at.
+	NetNS netns.Identity
 }
 
 // Explain classifies one address.
@@ -259,6 +309,8 @@ func Explain(q Query, tables []procnet.Table, env Env) Verdict {
 		V6Only:      env.V6Only,
 		Ephemeral:   env.Ephemeral,
 		Reserved:    env.Reserved,
+		Privileged:  env.Privileged,
+		NetNS:       env.NetNS,
 	}
 
 	var relevant []procnet.Table
@@ -295,7 +347,7 @@ func Explain(q Query, tables []procnet.Table, env Env) Verdict {
 		// The probe cannot repair a table that was never read: it can only say
 		// what one instant looked like. It is still recorded, because a bind
 		// that succeeded is worth knowing about next to an unreadable table.
-		return applyProbe(v, env.Probe)
+		return applyScopeLimits(applyProbe(v, env.Probe), env)
 	}
 
 	// Rows the kernel has already released are collected separately: they match
@@ -375,6 +427,7 @@ func Explain(q Query, tables []procnet.Table, env Env) Verdict {
 	}
 
 	v = applyEphemeral(v, env)
+	v = applyPrivileged(v, env)
 
 	// A row with inode 0 has no file descriptor behind it — a TIME_WAIT row, or a
 	// socket we closed that is still waiting out its timeout — so no amount of
@@ -403,7 +456,11 @@ func Explain(q Query, tables []procnet.Table, env Env) Verdict {
 	// State only unless a probe was actually made; the wording lives in
 	// applyProbe so that "not probed" and "probed, here is what happened" cannot
 	// both be said in one report.
-	return applyProbe(v, env.Probe)
+	//
+	// The limits that describe what a free answer did not cover come last,
+	// after the probe: a probe can turn free into unknown, and a caveat on an
+	// answer that no longer exists is a caveat a reader cannot place.
+	return applyScopeLimits(applyProbe(v, env.Probe), env)
 }
 
 // foldV6Wildcard settles whether an IPv6 wildcard listener also holds the
@@ -542,6 +599,65 @@ func applyEphemeral(v Verdict, env Env) Verdict {
 		detail += "; whether it is excluded from that pool could not be read: " + env.Reserved.Describe()
 	}
 	v.Reasons = append(v.Reasons, Reason{Code: ReasonEphemeralRange, Detail: detail})
+	return v
+}
+
+// applyPrivileged adds what the capability boundary says about this port.
+//
+// A port below net.ipv4.ip_unprivileged_port_start is refused with EACCES before
+// the kernel looks at any address, so it is neither taken nor free: it is
+// refused. The measurement decides, never the number 1024, because a host whose
+// boundary is 0 — every container by default — has no privileged port at all and
+// a warning there would be wrong on every run.
+//
+// It is stated on free and unknown answers only. Where the report already names
+// a holder, or already says the reservation is a TIME_WAIT row, the reader has
+// their diagnosis; a capability rule that did not stop their bind is noise.
+// Nothing here moves the kind or the exit code: this is the scope of the answer.
+func applyPrivileged(v Verdict, env Env) Verdict {
+	port := v.Query.Addr.Port
+	if port == 0 || !env.Privileged.NeedsRoot(port) {
+		return v
+	}
+	switch v.Kind {
+	case KindFree, KindUnknown:
+		v.Reasons = append(v.Reasons, Reason{
+			Code: ReasonPrivilegedPort,
+			// The measurement, not the mechanism: the sentence this code
+			// renders to says what the number means.
+			Detail: fmt.Sprintf("%d is below %d read from %s", port, env.Privileged.Port, env.Privileged.Path),
+		})
+	}
+	return v
+}
+
+// applyScopeLimits states what a free answer did not cover.
+//
+// Both codes here describe holes in a "go ahead", and only in a "go ahead":
+// anywhere else the report already answers the question the reader came with,
+// and piling scope caveats onto a diagnosis is how a reader learns to skip them.
+// They are added after the probe, because a refused bind turns free into unknown
+// and the caveat would then belong to an answer nobody is looking at.
+func applyScopeLimits(v Verdict, env Env) Verdict {
+	if v.Kind != KindFree {
+		return v
+	}
+	// Nil Lookup is "the walk was not attempted" (-no-holders), not "it came
+	// back empty": reporting unreadable processes there would blame the wrong
+	// thing, and the report already says no holder search was made.
+	if env.Lookup != nil && env.ProcsDenied > 0 {
+		v.Reasons = append(v.Reasons, Reason{
+			Code: ReasonHolderLookupIncomplete,
+			Detail: fmt.Sprintf("%d of %d process(es) could not be read",
+				env.ProcsDenied, env.ProcsRead+env.ProcsDenied),
+		})
+	}
+	if v.Query.Addr.Port != 0 && !env.Privileged.Known() {
+		v.Reasons = append(v.Reasons, Reason{
+			Code:   ReasonPrivilegedUnreadable,
+			Detail: env.Privileged.Describe(),
+		})
+	}
 	return v
 }
 
