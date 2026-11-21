@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/atop0914/portwhy/internal/netns"
 	"github.com/atop0914/portwhy/internal/probe"
 	"github.com/atop0914/portwhy/internal/procnet"
 	"github.com/atop0914/portwhy/internal/sockid"
@@ -157,10 +158,23 @@ func runWhy(args []string, stdout, stderr io.Writer) int {
 	measuredRange := sysctl.ReadPortRange(*sysctlDir)
 	measuredReserved := sysctl.ReadReservedPorts(*sysctlDir)
 
+	// The capability boundary: below it a non-root bind is refused with EACCES
+	// before any address is considered, which is neither "taken" nor "free". It
+	// is read from the tunable, never assumed to be 1024 — a host whose boundary
+	// is 0 (every container by default) has no privileged port at all.
+	measuredBoundary := sysctl.ReadPrivilegedPortStart(*sysctlDir)
+
+	// The namespace every row in this report came from. Read from the same
+	// procfs root the holder walk uses, so a test can state a namespace without
+	// being in one.
+	measuredNetNS := netns.Read(*procRoot)
+
 	env := verdict.Env{
-		V6Only:    measuredV6Only,
-		Ephemeral: measuredRange,
-		Reserved:  measuredReserved,
+		V6Only:     measuredV6Only,
+		Ephemeral:  measuredRange,
+		Reserved:   measuredReserved,
+		Privileged: measuredBoundary,
+		NetNS:      measuredNetNS,
 	}
 	if !*skipHolders {
 		idx, err := sockid.Scan(*procRoot)
@@ -318,32 +332,35 @@ var kindSentence = map[verdict.Kind]string{
 }
 
 var reasonSentence = map[string]string{
-	verdict.ReasonNoSockets:           "no row in the read tables matches this address",
-	verdict.ReasonListener:            "bind() to an address a listener holds fails with EADDRINUSE",
-	verdict.ReasonTimeWait:            "the reservation belongs to a closed connection, not to a running process",
-	verdict.ReasonOtherState:          "a bound socket in a non-listening state holds this address; whether bind() fails depends on socket options",
-	verdict.ReasonTableUnreadable:     "a socket table could not be read, so absence of a row proves nothing",
-	verdict.ReasonV6Wildcard:          "whether the IPv6 wildcard listener also holds this IPv4 address could not be answered: net.ipv6.bindv6only was not readable, and a default is not a measurement",
-	verdict.ReasonV6Shadow:            "the IPv6 wildcard listener holds this IPv4 address too: this host runs with bindv6only=0, so a [::] socket is dual-stack",
-	verdict.ReasonV6NoShadow:          "the IPv6 wildcard listener does not hold this IPv4 address: this host runs with bindv6only=1, so [::] is IPv6 only",
-	verdict.ReasonV6PerSocket:         "bindv6only is the default for new sockets, not a property of an existing one: a listener that set IPV6_V6ONLY for itself would leave IPv4 free, and only -probe can tell which",
-	verdict.ReasonV6OptOut:            "the wildcard looked dual-stack but a bind succeeded: that listener is IPv6-only for itself, an option the kernel reports nowhere, so this version does not promote the answer to free",
-	verdict.ReasonNoOwnerInode:        "a row with inode 0 has no descriptor behind it (TIME_WAIT, or a socket closed and waiting out its timeout), so no process can be named for it",
-	verdict.ReasonProcsDenied:         "some processes could not be read, so an unnamed holder may exist",
-	verdict.ReasonProbeNotRun:         "no bind was attempted: this verdict comes from kernel state only",
-	verdict.ReasonTeardown:            "rows on this address belong to sockets the kernel is already destroying, so they do not hold the port",
-	verdict.ReasonUnknownState:        "a row used a state code this build does not know, so what it does to a bind cannot be stated",
-	verdict.ReasonUnlistedBinding:     "a socket bound without listen() holds the port and has no row in these tables, so this answer cannot rule that out",
-	verdict.ReasonEphemeralRange:      "this port is inside the kernel's ephemeral range: an outbound connection may take it as its source port, which is why a fixed listener here fails only sometimes — a port a long-lived service depends on belongs outside that range",
-	verdict.ReasonEphemeralReserved:   "this port is excluded from the ephemeral range: the kernel will not take it as an outbound source port, so the occasional EADDRINUSE from the pool cannot come from here",
-	verdict.ReasonEphemeralUnreadable: "the ephemeral range could not be read, so whether the kernel may take this port for an outbound connection was not measured — the range Linux usually has is not a measurement of this host",
-	verdict.ReasonProbeBound:          "a plain bind succeeded, so the tables' silence was accurate at that instant and nothing — including a socket bound without listen() — held the address",
-	verdict.ReasonProbeRefused:        "a plain bind was refused: something holds this address",
-	verdict.ReasonProbeHolds:          "a plain bind was refused while no row covers the address: something bound this port without listen(), and no table lists it",
-	verdict.ReasonProbeOption:         "SO_REUSEADDR is what unblocks it — both attempts were made, and only the option one was accepted",
-	verdict.ReasonProbeDenied:         "the bind probe could not be made, so nothing was learned about the address — this is not a free port",
-	verdict.ReasonProbeGap:            "the probe evidence lacks the plain attempt that any conclusion about binding needs",
-	verdict.ReasonProbeConflict:       "the tables and the probe describe different instants, and this version cannot say which one you are facing",
+	verdict.ReasonNoSockets:              "no row in the read tables matches this address",
+	verdict.ReasonListener:               "bind() to an address a listener holds fails with EADDRINUSE",
+	verdict.ReasonTimeWait:               "the reservation belongs to a closed connection, not to a running process",
+	verdict.ReasonOtherState:             "a bound socket in a non-listening state holds this address; whether bind() fails depends on socket options",
+	verdict.ReasonTableUnreadable:        "a socket table could not be read, so absence of a row proves nothing",
+	verdict.ReasonV6Wildcard:             "whether the IPv6 wildcard listener also holds this IPv4 address could not be answered: net.ipv6.bindv6only was not readable, and a default is not a measurement",
+	verdict.ReasonV6Shadow:               "the IPv6 wildcard listener holds this IPv4 address too: this host runs with bindv6only=0, so a [::] socket is dual-stack",
+	verdict.ReasonV6NoShadow:             "the IPv6 wildcard listener does not hold this IPv4 address: this host runs with bindv6only=1, so [::] is IPv6 only",
+	verdict.ReasonV6PerSocket:            "bindv6only is the default for new sockets, not a property of an existing one: a listener that set IPV6_V6ONLY for itself would leave IPv4 free, and only -probe can tell which",
+	verdict.ReasonV6OptOut:               "the wildcard looked dual-stack but a bind succeeded: that listener is IPv6-only for itself, an option the kernel reports nowhere, so this version does not promote the answer to free",
+	verdict.ReasonNoOwnerInode:           "a row with inode 0 has no descriptor behind it (TIME_WAIT, or a socket closed and waiting out its timeout), so no process can be named for it",
+	verdict.ReasonProcsDenied:            "some processes could not be read, so an unnamed holder may exist",
+	verdict.ReasonProbeNotRun:            "no bind was attempted: this verdict comes from kernel state only",
+	verdict.ReasonTeardown:               "rows on this address belong to sockets the kernel is already destroying, so they do not hold the port",
+	verdict.ReasonUnknownState:           "a row used a state code this build does not know, so what it does to a bind cannot be stated",
+	verdict.ReasonUnlistedBinding:        "a socket bound without listen() holds the port and has no row in these tables, so this answer cannot rule that out",
+	verdict.ReasonEphemeralRange:         "this port is inside the kernel's ephemeral range: an outbound connection may take it as its source port, which is why a fixed listener here fails only sometimes — a port a long-lived service depends on belongs outside that range",
+	verdict.ReasonEphemeralReserved:      "this port is excluded from the ephemeral range: the kernel will not take it as an outbound source port, so the occasional EADDRINUSE from the pool cannot come from here",
+	verdict.ReasonEphemeralUnreadable:    "the ephemeral range could not be read, so whether the kernel may take this port for an outbound connection was not measured — the range Linux usually has is not a measurement of this host",
+	verdict.ReasonProbeBound:             "a plain bind succeeded, so the tables' silence was accurate at that instant and nothing — including a socket bound without listen() — held the address",
+	verdict.ReasonProbeRefused:           "a plain bind was refused: something holds this address",
+	verdict.ReasonProbeHolds:             "a plain bind was refused while no row covers the address: something bound this port without listen(), and no table lists it",
+	verdict.ReasonProbeOption:            "SO_REUSEADDR is what unblocks it — both attempts were made, and only the option one was accepted",
+	verdict.ReasonProbeDenied:            "the bind probe could not be made, so nothing was learned about the address — this is not a free port",
+	verdict.ReasonProbeGap:               "the probe evidence lacks the plain attempt that any conclusion about binding needs",
+	verdict.ReasonProbeConflict:          "the tables and the probe describe different instants, and this version cannot say which one you are facing",
+	verdict.ReasonHolderLookupIncomplete: "not every process could be read, so this answer was never checked against all of them: an unreadable one may hold the port",
+	verdict.ReasonPrivilegedPort:         "binding this port needs a capability this process may not have: it is below the boundary this host measured, so a bind is refused with EACCES before the address is even considered — that refusal is not a holder",
+	verdict.ReasonPrivilegedUnreadable:   "the privileged-port boundary could not be read, so whether this port needs root at all was not measured — the traditional limit is not a measurement of this host",
 }
 
 // limitReasons are the ones that describe what the answer does not cover. They
@@ -361,10 +378,22 @@ var limitReasons = map[string]bool{
 	// The pool range is a limit only when it could not be read; when it was
 	// read, the risk is part of the diagnosis and belongs in "why".
 	verdict.ReasonEphemeralUnreadable: true,
+	// The two scope statements from Day 6. Both are caveats on a "go ahead", so
+	// they are printed under "limits" where a reader looks for what the answer
+	// does not cover.
+	verdict.ReasonHolderLookupIncomplete: true,
+	verdict.ReasonPrivilegedUnreadable:   true,
 }
 
 func renderText(w io.Writer, v verdict.Verdict) error {
 	if err := fprintf(w, "%s/%s — %s\n", v.Query.Addr, v.Query.Proto, kindSentence[v.Kind]); err != nil {
+		return err
+	}
+
+	// The scope comes before the holders on purpose: "nothing holds this port"
+	// is a statement about one namespace, and a reader who has already decided
+	// what it means will not scroll back to find out which one.
+	if err := renderScope(w, v.NetNS); err != nil {
 		return err
 	}
 
@@ -446,6 +475,21 @@ func renderText(w io.Writer, v verdict.Verdict) error {
 		}
 	}
 	return nil
+}
+
+// renderScope names the network namespace the answer is about.
+//
+// The second line is unconditional and deliberately says nothing about the host:
+// the tool reads one namespace and cannot see the others, so what it owes the
+// reader is the boundary of its own view, not a guess about what is on the other
+// side of it. The tables it read cover one namespace even when -tables names a
+// directory elsewhere, which is why the wording does not claim to be yours.
+func renderScope(w io.Writer, n netns.Identity) error {
+	if err := fprintf(w, "scope: %s\n", n.Describe()); err != nil {
+		return err
+	}
+	return fprintf(w, "  the tables read here cover one network namespace; a holder in another "+
+		"one cannot be ruled out\n")
 }
 
 func writeReason(w io.Writer, r verdict.Reason) error {
@@ -669,6 +713,75 @@ type jsonEvidence struct {
 	// always present for the same reason: "not read" has to be visible as such.
 	EphemeralRange jsonPortRange     `json:"ephemeral_range"`
 	ReservedPorts  jsonReservedPorts `json:"reserved_ports"`
+	// NetNS is the namespace this report is about. A consumer that files the
+	// answer somewhere durable needs to know which namespace it describes.
+	NetNS jsonNetNS `json:"netns"`
+	// UnprivilegedPortStart is the capability boundary. Always present, and
+	// measured=false with no value is the only honest form of "not read".
+	UnprivilegedPortStart jsonPrivStart `json:"unprivileged_port_start"`
+}
+
+// jsonNetNS keeps the two halves of the reading apart: Error is "this process's
+// namespace was not read", ComparisonError is "pid 1's was not, so nothing was
+// compared". SameAsPIDOne is a pointer so that "no comparison" is null rather
+// than false — false would claim a difference nobody measured.
+type jsonNetNS struct {
+	Inode           uint64 `json:"inode,omitempty"`
+	Self            string `json:"self,omitempty"`
+	PIDOne          string `json:"pid_one,omitempty"`
+	SameAsPIDOne    *bool  `json:"same_as_pid_one"`
+	Path            string `json:"path"`
+	Error           string `json:"error,omitempty"`
+	ComparisonError string `json:"comparison_error,omitempty"`
+}
+
+func jsonNetNSOf(n netns.Identity) jsonNetNS {
+	out := jsonNetNS{
+		Inode:           n.Inode,
+		Self:            n.Self,
+		PIDOne:          n.PIDOne,
+		Path:            n.Path,
+		Error:           n.Err,
+		ComparisonError: n.SameErr,
+	}
+	switch n.Same {
+	case netns.PIDOneSame:
+		same := true
+		out.SameAsPIDOne = &same
+	case netns.PIDOneDifferent:
+		same := false
+		out.SameAsPIDOne = &same
+	}
+	return out
+}
+
+// jsonPrivStart follows the same shape as the other tunables: Measured says a
+// number was read (so Value is authoritative), Present says the file exists at
+// all. Measured=false + Present=true is a file that could not be understood;
+// Measured=false + Present=false is a kernel that does not offer the tunable.
+// Neither of them is 1024.
+type jsonPrivStart struct {
+	Measured bool   `json:"measured"`
+	Present  bool   `json:"present"`
+	Value    *int   `json:"value,omitempty"`
+	Raw      string `json:"raw,omitempty"`
+	Path     string `json:"path"`
+	Error    string `json:"error,omitempty"`
+}
+
+func jsonPrivStartOf(p sysctl.PrivilegedPortStart) jsonPrivStart {
+	out := jsonPrivStart{
+		Measured: p.Known(),
+		Present:  !p.Absent(),
+		Path:     p.Path,
+		Error:    p.Err,
+	}
+	if p.Known() {
+		value := int(p.Port)
+		out.Value = &value
+		out.Raw = strings.TrimSpace(p.Raw)
+	}
+	return out
 }
 
 // jsonPortRange has no zero value that reads as a measurement. Measured is the
@@ -755,13 +868,15 @@ func renderJSON(w io.Writer, v verdict.Verdict) error {
 		Findings: make([]jsonFinding, 0, len(v.Findings)),
 		Reasons:  make([]jsonReason, 0, len(v.Reasons)),
 		Evidence: jsonEvidence{
-			TablesRead:       v.TablesRead,
-			TablesUnreadable: v.TablesUnreadable,
-			ProcsRead:        v.ProcsRead,
-			ProcsDenied:      v.ProcsDenied,
-			BindV6Only:       jsonV6Only(v.V6Only),
-			EphemeralRange:   jsonPortRangeOf(v.Ephemeral),
-			ReservedPorts:    jsonReservedOf(v.Reserved),
+			TablesRead:            v.TablesRead,
+			TablesUnreadable:      v.TablesUnreadable,
+			ProcsRead:             v.ProcsRead,
+			ProcsDenied:           v.ProcsDenied,
+			BindV6Only:            jsonV6Only(v.V6Only),
+			EphemeralRange:        jsonPortRangeOf(v.Ephemeral),
+			ReservedPorts:         jsonReservedOf(v.Reserved),
+			NetNS:                 jsonNetNSOf(v.NetNS),
+			UnprivilegedPortStart: jsonPrivStartOf(v.Privileged),
 		},
 		Version: version.Resolve().Version,
 	}
@@ -851,13 +966,22 @@ flags for "why"
                    free, because a refused bind disproves that answer
   -no-holders      skip the /proc/<pid>/fd walk
   -tables DIR      kernel socket table directory (default %s)
-  -sysctl DIR      kernel tunable directory (default %s). Three are read:
+  -sysctl DIR      kernel tunable directory (default %s). Four are read:
                    net/ipv6/bindv6only (does a [::] listener also hold IPv4),
-                   and net/ipv4/ip_local_port_range with
+                   net/ipv4/ip_local_port_range and
                    net/ipv4/ip_local_reserved_ports (may the kernel hand this
-                   port out itself). A tunable that cannot be read is reported
-                   as a limit, never replaced by the usual value
-  -proc ROOT       procfs root used to name holders (default %s)
+                   port out itself), and
+                   net/ipv4/ip_unprivileged_port_start (may this process bind
+                   it without a capability). A tunable that cannot be read is
+                   reported as a limit, never replaced by the usual value
+  -proc ROOT       procfs root used to name holders and to name this process's
+                   network namespace (default %s)
+
+every report states its scope
+  the first two lines name the network namespace the answer is about, because
+  "nothing holds this port" is only ever true of one namespace. portwhy reads
+  exactly one and cannot see a holder in another, so it says so instead of
+  implying the answer covers the machine
 
 exit codes
   0  free: nothing readable occupies it
