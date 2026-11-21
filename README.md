@@ -7,6 +7,8 @@ answer.
 ```
 $ portwhy why 127.0.0.1:8080
 127.0.0.1:8080/tcp — a listening socket holds it
+scope: net:[4026532486], this process's network namespace, the same one pid 1 runs in
+  the tables read here cover one network namespace; a holder in another one cannot be ruled out
 
 holders
   LISTEN         127.0.0.1:8080         pid 892 (python3) fd 3 [sole] inode 29866188
@@ -18,6 +20,10 @@ limits
   - no bind was attempted: this verdict comes from kernel state only
   - holder lookup walked 3 process(es), 0 not readable
 ```
+
+The `scope` pair is not decoration: "nothing holds this port" is only ever true of
+one network namespace. The tool reads exactly one and says which, instead of
+letting a container's answer read as the machine's.
 
 When a listener is shared, every holder is listed with what the process tree proves
 about it: `creator` (it was there first — talk to this one), `inherited` (it was
@@ -39,6 +45,8 @@ real, twice:
 ```
 $ portwhy why 127.0.0.1:43569 --probe
 127.0.0.1:43569/tcp — cannot be determined from what was readable
+scope: net:[4026532486], this process's network namespace, the same one pid 1 runs in
+  the tables read here cover one network namespace; a holder in another one cannot be ruled out
 
 why
   - no row in the read tables matches this address
@@ -63,6 +71,8 @@ between them is the diagnosis:
 ```
 $ portwhy why 127.0.0.1:44433 --probe
 127.0.0.1:44433/tcp — only TIME_WAIT rows hold it
+scope: net:[4026532486], this process's network namespace, the same one pid 1 runs in
+  the tables read here cover one network namespace; a holder in another one cannot be ruled out
 
 holders
   TIME_WAIT      127.0.0.1:44433        no open descriptor           inode 0
@@ -100,6 +110,8 @@ tunable and prints what it found:
 ```
 $ portwhy why 127.0.0.1:18080
 127.0.0.1:18080/tcp — a listening socket holds it
+scope: net:[4026532486], this process's network namespace, the same one pid 1 runs in
+  the tables read here cover one network namespace; a holder in another one cannot be ruled out
 
 holders
   LISTEN         [::]:18080             pid 170 (server) fd 4 [sole]     inode 42451711
@@ -128,6 +140,8 @@ it:
 ```
 $ portwhy why 127.0.0.1:18082 --probe     # [::] bound as tcp6, so V6ONLY for that socket
 127.0.0.1:18082/tcp — cannot be determined from what was readable
+scope: net:[4026532486], this process's network namespace, the same one pid 1 runs in
+  the tables read here cover one network namespace; a holder in another one cannot be ruled out
 
 why
   - the wildcard looked dual-stack but a bind succeeded: that listener is
@@ -150,6 +164,8 @@ connections takes the port first.
 ```
 $ portwhy why 127.0.0.1:46883
 127.0.0.1:46883/tcp — nothing in the kernel tables occupies it
+scope: net:[4026532486], this process's network namespace, the same one pid 1 runs in
+  the tables read here cover one network namespace; a holder in another one cannot be ruled out
 
 why
   - no row in the read tables matches this address
@@ -204,6 +220,63 @@ most common range, not this host's range, and a report that prints them for a
 host it never read is exactly the confident wrong answer this tool exists to
 replace.
 
+## Whose port, and whose namespace
+
+Two things decide whether an answer is about *your* situation, and both are
+measurements rather than assumptions: which network namespace was read, and
+whether this process may bind the port at all.
+
+The namespace is the first two lines of every report. `--network host` and the
+default bridge report different numbers on the same machine, and neither claims to
+be an initial or host namespace — a container's pid 1 is the container's init, so
+"the same namespace as pid 1" measures the boundary between two processes and
+nothing about the host:
+
+```
+$ portwhy why 127.0.0.1:8080
+127.0.0.1:8080/tcp — nothing in the kernel tables occupies it
+scope: net:[4026532486], this process's network namespace, the same one pid 1 runs in
+  the tables read here cover one network namespace; a holder in another one cannot be ruled out
+```
+
+The capability boundary is separate from "taken" and from "free". A port below
+`net.ipv4.ip_unprivileged_port_start` is refused with `EACCES` before the kernel
+looks at any address:
+
+```
+$ portwhy why 127.0.0.1:80          # this host measures ip_unprivileged_port_start = 1024
+127.0.0.1:80/tcp — nothing in the kernel tables occupies it
+scope: net:[4026532486], this process's network namespace, the same one pid 1 runs in
+  the tables read here cover one network namespace; a holder in another one cannot be ruled out
+
+why
+  - no row in the read tables matches this address
+  - binding this port needs a capability this process may not have: it is below the
+    boundary this host measured, so a bind is refused with EACCES before the address
+    is even considered — that refusal is not a holder (80 is below 1024 read from
+    /proc/sys/net/ipv4/ip_unprivileged_port_start)
+```
+
+The same port on a host whose boundary is 0 — every container by default — is
+reported with no capability line at all, because there nothing needs root. Warning
+about port 80 there would be wrong on every run. And when the tunable cannot be
+read, the limit says so without printing `1024`: the traditional boundary is not a
+measurement of this host.
+
+The last hole is the quiet one. If some processes could not be read, a `free`
+answer has no socket to point at, so the holder it missed could be among them:
+
+```
+limits
+  - not every process could be read, so this answer was never checked against all
+    of them: an unreadable one may hold the port (2 of 3 process(es) could not be read)
+  - holder lookup walked 1 process(es), 2 not readable
+```
+
+That is a limit, not a verdict: the kind stays `free` and the exit code stays 0,
+because nothing measured a holder. `-no-holders` is a different sentence — nothing
+was read rather than something failing to be read, and it prints neither line.
+
 ## Why another one
 
 `ss` and `lsof` list sockets. They do not answer the question people actually
@@ -216,6 +289,7 @@ have, which is *which of the four different things* is wrong:
 | a listener on `0.0.0.0` while you asked for one interface | the wildcard covers you | same as the first row |
 | a listener on `[::]` while you asked for IPv4 | it depends on `net.ipv6.bindv6only` | measured per host, not assumed |
 | nothing at all, but it fails now and then | the port is in the kernel's outbound source-port pool | pick a port outside that range |
+| nothing at all, and `EACCES` instead of `EADDRINUSE` | the port is below `net.ipv4.ip_unprivileged_port_start` | bind it with the capability, or use a higher port |
 
 The fourth row is why this tool exists. Most advice on the internet collapses all
 of these into "kill the process or set `SO_REUSEADDR`", and part of that advice is
@@ -258,8 +332,8 @@ portwhy version
 | `-probe` | attempt a real `bind()` twice — plain, then `SO_REUSEADDR` — and report what the kernel answered. Never calls `listen()`. tcp only |
 | `-no-holders` | skip the `/proc/<pid>/fd` walk: kernel state only |
 | `-tables DIR` | read the socket tables from DIR instead of `/proc/net` |
-| `-sysctl DIR` | read `net/ipv6/bindv6only` from DIR instead of `/proc/sys` (the only tunable this tool reads) |
-| `-proc ROOT` | use ROOT instead of `/proc` when naming the holder |
+| `-sysctl DIR` | read the tunables from DIR instead of `/proc/sys`: `net/ipv6/bindv6only`, `net/ipv4/ip_local_port_range`, `net/ipv4/ip_local_reserved_ports`, `net/ipv4/ip_unprivileged_port_start` |
+| `-proc ROOT` | use ROOT instead of `/proc` when naming the holder and when naming this process's network namespace |
 
 `:8080` means every interface (`0.0.0.0:8080`). `[::1]:8080` is IPv6.
 
@@ -296,8 +370,16 @@ Written down because the boundary is the product:
   `TIME_WAIT` to wait out, so a TCP-style probe would be a different experiment
   reported as the answer to this one. `-proto udp` with `--probe` is rejected.
 - **It does not see other network namespaces.** Inside a container, a port held
-  on the host is invisible. The report describes the namespace it ran in; it
-  never claims a port is free on the machine.
+  on the host is invisible. Every report now names the namespace it read, and says
+  that a holder in another one cannot be ruled out — naming a namespace does not
+  let it look inside another.
+- **It does not claim to know which namespace is the machine's initial one.** From
+  inside, none: a container's pid 1 is the container's init. The report stops at
+  what it measured.
+- **It does not decide whether a port is privileged from a rule of thumb.** The
+  boundary comes from `net.ipv4.ip_unprivileged_port_start`; when that cannot be
+  read, the report says so and prints no number. It also never turns that finding
+  into `taken`: needing root is not being occupied.
 - **It does not estimate how long a `TIME_WAIT` will last.** The kernel does not
   expose the age of a socket, so any "12 seconds left" would be invented.
 - **It does not name the holder of a `TIME_WAIT` row.** Those rows carry inode 0
@@ -332,6 +414,8 @@ Written down because the boundary is the product:
 /proc/sys/net/ipv6/bindv6only          → internal/sysctl    does [::] also hold IPv4
 /proc/sys/net/ipv4/ip_local_port_range → internal/sysctl    may the kernel take this port
 /proc/sys/net/ipv4/ip_local_reserved_ports                   ...and was it excluded
+/proc/sys/net/ipv4/ip_unprivileged_port_start                may this process bind it
+/proc/self/ns/net, /proc/1/ns/net      → internal/netns     which namespace is this
 /proc/<pid>/fd/* → "socket:[inode]"    → internal/sockid    who holds which inode
 bind() twice, never listen()           → internal/probe     what the kernel does now
                         ↓
@@ -340,9 +424,9 @@ bind() twice, never listen()           → internal/probe     what the kernel do
                   cmd/portwhy           text / JSON, exit codes
 ```
 
-Only `internal/procnet`, `internal/sysctl`, `internal/sockid` and `internal/probe`
-touch the system; `internal/verdict` is a pure function over rows and injected
-evidence, which is why the four causes above — and every way the probe or the
-tunable can contradict them — can be tested without opening a socket. See
+Only `internal/procnet`, `internal/sysctl`, `internal/netns`, `internal/sockid` and
+`internal/probe` touch the system; `internal/verdict` is a pure function over rows
+and injected evidence, which is why the four causes above — and every way the probe
+or the tunable can contradict them — can be tested without opening a socket. See
 [docs/design.md](docs/design.md) for the decisions behind that split and the cases
 this version deliberately refuses to answer.

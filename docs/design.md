@@ -162,6 +162,46 @@ worked after a restart". The tables do not record which side opened a connection
 so the report does not say so either — it states the interval, the file, and the
 mechanism.
 
+### The capability boundary: measured, never 1024
+
+Below `net.ipv4.ip_unprivileged_port_start` a `bind()` is refused with `EACCES`
+before the kernel looks at any address. That is a third thing: not "someone holds
+it" and not "it is free", but "this process may not have it". The tunable is read,
+and it has the same three states as the other two, with one rule that matters more
+here than anywhere else: **the number 1024 must never stand in for the
+measurement.**
+
+| state | what it means | what the report says |
+|---|---|---|
+| measured | the file held one port number | the port, the boundary, the file it came from |
+| absent | the kernel does not publish the tunable (Linux before 4.11) | that no boundary could be read, and the path it looked in |
+| unreadable | the file was there and did not parse | the same, with the parse error |
+
+`0` is a measurement, and it is the one containers usually have: with the boundary
+at 0 no port is privileged, so a tool that assumed 1024 would warn about port 80
+on every single run. The rule is symmetric to the pool's: the statement is added
+to `free` and `unknown` answers, never to an answer that already names a holder,
+and it never changes the kind or the exit code.
+
+### The namespace: one, and only its own
+
+Every row in `/proc/net` belongs to one network namespace. A container has its
+own, so a port held on the host is invisible inside it and vice versa — a `free`
+answer is always "free *here*". This version reads `/proc/self/ns/net` and prints
+the link the kernel printed, plus whether pid 1 shares it, so the scope of the
+answer is a measurement rather than an assumption.
+
+The field this deliberately does **not** have is "initial namespace". Inside a
+container pid 1 is the container's init, so "the same namespace as pid 1" is a
+measurement of the boundary between two processes and says nothing about the host.
+A field the tool cannot fill would be a field a reader would trust; the honest
+sentence is that only sockets in one namespace were read and a holder in another
+cannot be ruled out.
+
+The namespace never changes the kind, because the answer is always about the
+namespace that was read. What it does change is the claim: without it, "nothing
+holds this port" reads as a statement about the machine.
+
 ## 3. Capability boundary
 
 ### What the data sources can prove
@@ -178,6 +218,15 @@ mechanism.
 - The `bind()` consequence of every state, from one table that is asserted against
   the kernel's own twelve state codes rather than sampled
   (`internal/procnet/state_test.go`).
+- `net.ipv4.ip_unprivileged_port_start`: which ports this process may bind without
+  a capability. Proven by reading the same file independently in the test and
+  comparing (`internal/sysctl/privileged_linux_test.go`), and end to end by running
+  the binary as uid 65534 in a container whose boundary is 1024 — it reports the
+  boundary it read and a probe there really does return `EACCES`.
+- `/proc/self/ns/net` and `/proc/1/ns/net`: which network namespace this process
+  is in, and whether pid 1 shares it. Proven against an independent `readlink` of
+  the host's own link, and against real symlink trees for the states a host cannot
+  be asked to provide (`internal/netns/read_linux_test.go`).
 - Which of several holders had a shared socket first, as far as the process tree
   can say: a shared socket arrives through `fork()`, so a holder that is an
   ancestor of the others must precede them. Proven with a real forked child
@@ -187,7 +236,17 @@ mechanism.
 
 - **Other network namespaces.** A port held on the host is invisible inside a
   container, and vice versa. A `free` answer is therefore always "free *here*".
-  This tool does not claim otherwise anywhere in its output.
+  The namespace is now named in every report, but naming it does not let this tool
+  look inside another one: there is no path from a process to a namespace it is
+  not in, and pretending otherwise would be the one invention that makes every
+  other answer suspect.
+- **Which namespace is the machine's initial one.** From inside, none: a
+  container's pid 1 is the container's init, so "same namespace as pid 1" measures
+  the boundary between two processes and not the host. The report stops at what it
+  measured.
+- **Whether a port needs root, before the tunable is read.** On a kernel without
+  `ip_unprivileged_port_start` the traditional 1024 is a tradition. The report says
+  the boundary could not be read and leaves the question open.
 - **The age of a socket.** The kernel does not expose when a `TIME_WAIT` row was
   created, so "released in 43 s" would be a fabrication. Refused.
 - **Whether `[::]` occupies IPv4, in general.** The machine-wide default is
@@ -240,6 +299,7 @@ mechanism.
 ```
 internal/procnet   files → []Socket          (pure over an io.Reader)
 internal/sysctl    tunables → measured value (0/1, an interval, or unreadable)
+internal/netns     procfs → this process's network namespace, and pid 1's
 internal/sockid    inodes → holders          (the only /proc/<pid> walker)
 internal/probe     address → []Attempt       (real bind(); never listen())
 internal/verdict   []Socket + evidence → Kind (pure; evidence is an argument)
@@ -311,6 +371,23 @@ Each of these is a test today, and each is a way the tool could become harmful:
   must not be reported as "nothing is reserved".
 - A port 0 query must not produce a pool warning: port 0 is "pick one", which is
   what the pool is for.
+- A port below the measured `ip_unprivileged_port_start` must be reported as
+  needing a capability, with the number and the file, and the kind must not move.
+- A host whose boundary is 0 must produce no capability statement about port 80:
+  warning there would be wrong on every run in a container.
+- An unread or absent boundary must produce a limits line containing no `1024`.
+- A `free` answer assembled from a walk that could not read every process must say
+  so (`holder-lookup-incomplete`) and must still exit 0 — and `-no-holders`, which
+  reads nothing rather than failing to read, must produce neither that line nor a
+  count of unreadable processes.
+- A refused bind that collapses `free` into `unknown` must drop those free-answer
+  caveats: they belong to an answer nobody is looking at any more.
+- A namespace that could not be read must be reported as such, with no inode
+  invented, and no output may claim to describe an initial, host, or other
+  namespace.
+- Every text report must name the namespace it read on a `scope:` line, and two
+  runs over the same input must be byte identical — a scope line that drifted
+  would make the rest of the report undiffable.
 
 ## 6. What the probe does, and what is still later
 
