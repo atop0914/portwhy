@@ -28,6 +28,8 @@ every week.
 |---|---|---|
 | `free` | every relevant table was read successfully and no row occupies the address | a socket in an unread table; a namespace we cannot see; a bind that fails for a reason other than the address being held (`EACCES` below 1024, `EADDRNOTAVAIL`) |
 | `listening` | a row in `LISTEN` whose local address covers the query | nothing: the row is the state |
+| `bound` | the same, in a protocol that has no `LISTEN`: a UDP row whose local address covers the query | nothing: the row is the state. It is a separate kind because "a listening socket holds it" would be false — UDP never listens, and a sentence that has to be translated is a sentence that can be misread |
+| `stale-path` | no row in `/proc/net/unix` carries the name, and something exists at the path | a row in a table that could not be read; a path measurement that failed (that is `unknown`, never `stale-path`); a non-socket entry is the same kind with a different reason, because the fix is the same and the description must not be |
 | `time-wait-only` | rows in `TIME_WAIT` and nothing else | a non-`TIME_WAIT` row in an unread table |
 | `occupied-non-listening` | rows in another bound state | whether the bind actually fails: it may not, if `SO_REUSEADDR`/`SO_REUSEPORT` is set. Without a probe this version reports the occupation and says the consequence is unverified; with `--probe` the consequence is measured, and a successful bind becomes a conflict rather than a quiet contradiction |
 | `unknown` | a table that should exist could not be read, or an IPv6 wildcard may be shadowing IPv4 and `bindv6only` could not be read | nothing: `unknown` is the honest floor |
@@ -56,6 +58,55 @@ describe is a hole in the evidence, and `UNKNOWN(0x..)` in the output is the too
 saying so. And `CLOSE` is not a holder — the row is disclosed in the reasons and
 left out of the holders list, because naming a process for a socket the kernel has
 released sends the reader off to kill something that is already gone.
+
+### One column, two vocabularies
+
+`/proc/net/tcp` and `/proc/net/udp` print the state in the same column, and the
+numbers do not mean the same thing. `0x07` is `CLOSE` in a TCP table — the socket
+has been unhashed and blocks nothing — and it is "bound, not connected" in a UDP
+table, which is the ordinary state of a bound UDP socket and does block a plain
+`bind()`. Measured, not assumed: a UDP socket bound to 53688 makes the next plain
+`bind()` fail with `EADDRINUSE` while its row says `07`.
+
+So the effect table is selected by the row's own protocol
+(`State.BindingFor(proto)`, reached as `Socket.Binding()`), and the classification
+then branches: a blocking TCP row is a listener, a blocking UDP row is a bound
+socket. Sharing one table would have been the single most plausible bug in this
+codebase, and it had already produced one: the IPv6 wildcard shadow check looked
+for `StateListen`, so a UDP `[::]` shadowing IPv4 could never be found.
+
+The prediction "`st=07` in TCP is released" is also what the `free` answer relies
+on, which is why the two tables are asserted separately rather than through a
+shared helper.
+
+### A name is not a port
+
+A unix socket name has no protocol, no port, no pool and no privileged boundary,
+so its judgement rests on two independent measurements instead of one table:
+whether a row in `/proc/net/unix` carries the name, and whether something exists
+at the path. Both were verified by binding for real, because the interesting part
+is that they disagree:
+
+| row | path | kind | what `bind()` does |
+|---|---|---|---|
+| yes | exists (socket) | `bound` | fails `EADDRINUSE` — a live socket holds the name |
+| no | exists (socket) | `stale-path` | fails `EADDRINUSE` anyway: the name outlived the process, and no row can be found. Removing the file is the fix |
+| no | exists (not a socket) | `stale-path` | the same failure with a different cause, so a different reason code: calling a regular file a stale socket would misdescribe what the user has to delete |
+| yes | absent | `free` | succeeds: the name was unlinked while the socket stayed open, so the row describes a socket nobody can reach |
+| no | absent | `free` | succeeds |
+| either | not measured | `unknown` | nothing can be claimed: "nobody looked" is not "nothing is there" |
+
+The abstract namespace (`@name`) has no path at all: it is judged on the row
+alone, and the report says so instead of printing a path line that was never
+measured. `@demo` and `/demo` are different sockets and can be bound
+simultaneously — verified — so the namespace is taken from the query, never
+inferred by stripping a character.
+
+Whether a unix socket listens is `SO_ACCEPTCON` in the flags column
+(`0x00010000`), not the state value: `01`/`02` there is the socket type
+(stream/dgram). The report prints "listening" or "bound" per holder, because that
+difference decides whether anything can still connect to it.
+
 
 ### The probe, and the one direction it may move
 
@@ -284,6 +335,17 @@ holds this port" reads as a statement about the machine.
   and the `srcconn` helper): the kernel does accept a chosen in-pool port as an
   outbound source port, and while that connection lives `bind()` to it really does
   fail with `EADDRINUSE`.
+- **Which process left a unix socket file behind.** There is no socket any more:
+  the row disappeared with the process, and only the directory entry survived. The
+  report says the name is in the way and that no process holds it, instead of
+  naming a pid it cannot know.
+- **Whether a UDP socket that holds the port set `SO_REUSEADDR`.** Two sockets that
+  both set it can share the address, and the option is not in any table. So the
+  report says "a second *plain* bind fails", which is what was measured, rather
+  than "the address is taken", which would be a claim about options nobody can see.
+- **Whether a unix name is free while the table could not be read.** The stale-file
+  case and the "nobody looked" case are one measurement apart, so the second is
+  `unknown`. A `free` name is only claimed when both halves were measured.
 
 ### Deliberately not done
 
@@ -297,7 +359,8 @@ holds this port" reads as a statement about the machine.
 ## 4. Layers and the invariant
 
 ```
-internal/procnet   files → []Socket          (pure over an io.Reader)
+internal/procnet   files → []Socket          (pure over an io.Reader; per-protocol state)
+internal/unixsock  /proc/net/unix + lstat → rows and a three-state path
 internal/sysctl    tunables → measured value (0/1, an interval, or unreadable)
 internal/netns     procfs → this process's network namespace, and pid 1's
 internal/sockid    inodes → holders          (the only /proc/<pid> walker)
@@ -388,6 +451,28 @@ Each of these is a test today, and each is a way the tool could become harmful:
 - Every text report must name the namespace it read on a `scope:` line, and two
   runs over the same input must be byte identical — a scope line that drifted
   would make the rest of the report undiffable.
+- A UDP row in state `07` must block its own protocol and must not be read through
+  the TCP table in either direction: `07` in a TCP table must stay released, and a
+  UDP answer must never be called `listening`.
+- A `-proto udp` query must not be affected by a TCP listener on the same port, and
+  `-proto tcp` must not be affected by a UDP socket. `-proto both` must print two
+  answers, and the exit code must name which answer it came from.
+- A unix name must be matched byte for byte, not by prefix: `/run/app.sock` does
+  not hold `/run/app.sock.old`, and the test that says so keeps a socket file at
+  the queried path — without one, a wrong match and a right one both end in `free`
+  and the assertion would pass for the wrong reason.
+- A unix path that does not exist must never be reported as held, and an abstract
+  name must never be looked up in the filesystem.
+- A stale socket file must not be `free` and must not be `taken` either: it has its
+  own kind, because the answer "no process holds this" and the answer "bind() will
+  fail" are both true at once.
+- A unix socket file with no row must be answered `stale-path` even though the
+  table said nothing — the one place where "no row" does not mean "free".
+- A reason may not restate a fact that already has its own line in the report: the
+  path is printed on a `path:` line, so no detail may mention it. A detail states a
+  measurement (a count, an inode) or it is not printed.
+- The zero-value path measurement must produce `unknown`, never `free`: a caller
+  that forgot to look has not established that nothing is there.
 
 ## 6. What the probe does, and what is still later
 

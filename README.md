@@ -4,6 +4,10 @@ Explain why a port cannot be bound — from the kernel's own tables, with the
 names of the processes holding it, and with "I could not tell" as a distinct
 answer.
 
+The same question is answered for a unix socket name, where the two failures look
+nothing like a port: a name can be in the way with nobody behind it, and a name
+can be free while the table still shows a socket.
+
 ```
 $ portwhy why 127.0.0.1:8080
 127.0.0.1:8080/tcp — a listening socket holds it
@@ -220,6 +224,104 @@ most common range, not this host's range, and a report that prints them for a
 host it never read is exactly the confident wrong answer this tool exists to
 replace.
 
+## The port that is bound and never listens
+
+A UDP socket never listens. `bind()` takes the port, `connect()` remembers a
+peer, and there is nothing in between — but the port is held all the same, and a
+second plain `bind()` fails exactly as it does over TCP:
+
+```
+$ portwhy why -proto udp 127.0.0.1:53535
+127.0.0.1:53535/udp — a bound socket holds it (udp has no listening state)
+scope: net:[4026532486], this process's network namespace, the same one pid 1 runs in
+  the tables read here cover one network namespace; a holder in another one cannot be ruled out
+
+holders
+  CLOSE          127.0.0.1:53535        pid 1232 (hold) fd 4 [sole]  inode 46961390
+
+why
+  - a UDP socket is bound to this address and keeps the port to itself: a second
+    plain bind() fails with EADDRINUSE, and the fix is to find that process — or,
+    if both sides agree to it, to share the port with SO_REUSEADDR
+```
+
+`CLOSE` there does not mean what it means in TCP. `/proc/net/udp` and
+`/proc/net/tcp` share one state column, and `0x07` reads in opposite directions:
+in TCP it is `CLOSE`, a socket the kernel has already unhashed and which blocks
+nothing; in UDP it is "bound and not connected", the ordinary state of a bound
+UDP socket — and it blocks a plain `bind()`. Reading that column with TCP's
+vocabulary turns a held port into a free one, so the state table is interpreted
+per protocol instead of shared. The same mistake used to hide a second case: a
+UDP `[::]` wildcard shadowing IPv4 was unfindable, because the shadow check
+looked for `LISTEN` and a UDP socket is never in it.
+
+`SO_REUSEADDR` does what it says for UDP: two sockets that both set it can hold
+the same address, which is why the report says "a second *plain* bind fails"
+rather than "the address is taken". The verdict is about the bind you are about
+to make, not about a count of holders.
+
+TCP and UDP are separate namespaces, so `-proto both` gives two answers rather
+than one merged kind:
+
+```
+$ portwhy why -proto both 127.0.0.1:53535
+127.0.0.1:53535/tcp — nothing in the kernel tables occupies it
+...
+127.0.0.1:53535/udp — a bound socket holds it (udp has no listening state)
+...
+exit code: 0, from the tcp answer; the udp answer alone would exit 1
+```
+
+A merged answer would tell the UDP user "free" and the TCP user "taken", so the
+two are printed and the one the exit code came from is named in the report.
+
+## The name in the way with nobody behind it
+
+A unix socket is not a port and has no protocol to be shared in. It is a name,
+and two independent measurements decide it: whether a row in `/proc/net/unix`
+carries that name, and what is at the path. They disagree in both directions,
+and both disagreements were verified by binding for real rather than reasoned
+about:
+
+```
+$ portwhy unix /tmp/demo.sock                   # a listener is running
+/tmp/demo.sock — a socket is bound to this name
+path: exists (socket)
+
+holders
+  stream     listening  inode 46972368   pid 1231 (hold) fd 4 [sole]
+```
+
+```
+$ kill 1231                                     # no cleanup: the file stays
+$ ls -l /tmp/demo.sock
+srwxr-xr-x 1 root root 0 Nov 22 12:51 /tmp/demo.sock
+$ portwhy unix /tmp/demo.sock
+/tmp/demo.sock — the name is in the way, but no running socket holds it
+path: exists (socket)
+
+why
+  - the socket file is still there and no process holds it: bind() keeps failing
+    until that file is removed, and looking for a process to kill will find
+    nothing (0 row(s) in the unix table)
+```
+
+That is the same shape as a socket bound without `listen()`: the kernel says
+nothing, and the bind still fails. It is not `taken`, because no process holds
+anything — sending someone to look for a process would waste their afternoon.
+Removing the file is the fix, and the report says so.
+
+The mirror case exists too. `unlink()` the name while the socket stays open and
+the table keeps its row while the filesystem has nothing, so a new `bind()`
+*creates a new file and succeeds*: the old socket is unreachable, not in the way.
+That answer is `free`, with a reason naming the released row, because "a row
+exists" on its own would be read as "hold on".
+
+Abstract names (`@name`) live only in the kernel: they are never looked up in
+the filesystem, and `@demo` and `/demo` are two different sockets that can be
+bound at the same time — verified, and the reason the report says which namespace
+it is asking about instead of assuming the leading `@` was a typo.
+
 ## Whose port, and whose namespace
 
 Two things decide whether an answer is about *your* situation, and both are
@@ -290,12 +392,19 @@ have, which is *which of the four different things* is wrong:
 | a listener on `[::]` while you asked for IPv4 | it depends on `net.ipv6.bindv6only` | measured per host, not assumed |
 | nothing at all, but it fails now and then | the port is in the kernel's outbound source-port pool | pick a port outside that range |
 | nothing at all, and `EACCES` instead of `EADDRINUSE` | the port is below `net.ipv4.ip_unprivileged_port_start` | bind it with the capability, or use a higher port |
+| a row in state `07` in `/proc/net/udp` | a UDP socket is bound and not connected — no listener, still held | stop that process, or share with `SO_REUSEADDR` |
+| a unix socket file with no row in `/proc/net/unix` | the process is gone and the name outlived it | remove the file |
 
 The fourth row is why this tool exists. Most advice on the internet collapses all
 of these into "kill the process or set `SO_REUSEADDR`", and part of that advice is
 wrong on modern systems: Go sets `SO_REUSEADDR` on listeners by default, so a
 `TIME_WAIT` row often does not block a Go server at all. A tool that repeats the
 folklore is worse than no tool.
+
+The last two rows are why it grew past ports. `ss` and `lsof` both show a bound
+UDP socket as something that is not listening and a stale socket file as a file,
+which is true and useless: in one case a process must be found, in the other
+there is no process at all and the file must be deleted.
 
 Two things follow from that, and they are the design:
 
@@ -320,16 +429,17 @@ Zero third-party dependencies, no cgo. Linux only: the whole answer comes from
 
 ```
 portwhy why <host:port> [flags]
+portwhy unix <path|@name> [flags]
 portwhy states
 portwhy version
 ```
 
 | flag | meaning |
 |---|---|
-| `-proto tcp\|udp` | which protocol to check (default `tcp`) |
+| `-proto tcp\|udp\|both` | which protocol to check (default `tcp`). `both` answers each protocol separately and reports the `tcp` answer's exit code, saying so in the output |
 | `-json` | machine-readable report on stdout |
 | `-all` | also list every row that mentions the port, with why it did or did not take part (the verdict does not change) |
-| `-probe` | attempt a real `bind()` twice — plain, then `SO_REUSEADDR` — and report what the kernel answered. Never calls `listen()`. tcp only |
+| `-probe` | attempt a real `bind()` twice — plain, then `SO_REUSEADDR` — and report what the kernel answered. Never calls `listen()`. tcp only, so it is a usage error together with `-proto udp` or `-proto both` |
 | `-no-holders` | skip the `/proc/<pid>/fd` walk: kernel state only |
 | `-tables DIR` | read the socket tables from DIR instead of `/proc/net` |
 | `-sysctl DIR` | read the tunables from DIR instead of `/proc/sys`: `net/ipv6/bindv6only`, `net/ipv4/ip_local_port_range`, `net/ipv4/ip_local_reserved_ports`, `net/ipv4/ip_unprivileged_port_start` |
@@ -337,8 +447,15 @@ portwhy version
 
 `:8080` means every interface (`0.0.0.0:8080`). `[::1]:8080` is IPv6.
 
+`portwhy unix` takes its own smaller flag set — `-json`, `-tables DIR`, `-proc ROOT`,
+`-no-holders` — because none of the port questions apply: there is no ephemeral
+pool, no privileged boundary and no probe for a name. `@name` is the abstract
+namespace, which is never looked up in the filesystem.
+
 `portwhy states` prints the twelve TCP states with what each one does to a
-`bind()`, so the rule behind a verdict can be read instead of inferred.
+`bind()`, plus the two states a UDP table actually contains, with the effect each
+one has on that protocol. The `0x07` row is the interesting pair: `teardown` in
+the TCP column and `blocks` in the UDP column, the same number from one column.
 
 ### Exit codes
 
@@ -347,7 +464,7 @@ These are the contract, and the third one is the reason the contract exists:
 | code | meaning |
 |---|---|
 | 0 | free — every relevant table was read and nothing occupies it |
-| 1 | taken — a listener, a `TIME_WAIT` reservation, or another socket holds it |
+| 1 | taken — a listener, a bound udp socket, a `TIME_WAIT` reservation, another socket, or a unix name that cannot be bound |
 | 2 | usage or internal error |
 | 3 | unknown — the evidence needed was missing. **This is not "free".** |
 
@@ -368,7 +485,16 @@ Written down because the boundary is the product:
   and the instant of each.
 - **It does not probe UDP.** UDP has no listener to be refused by and no
   `TIME_WAIT` to wait out, so a TCP-style probe would be a different experiment
-  reported as the answer to this one. `-proto udp` with `--probe` is rejected.
+  reported as the answer to this one. `-proto udp` with `--probe` is rejected, and
+  so is `-proto both`, which would run the TCP experiment and print it next to a
+  UDP answer.
+- **It does not look for the process that left a unix socket file behind.** There
+  is no socket for it any more: the kernel dropped the row when the process died,
+  and only the directory entry survived. The report says the file is in the way
+  and that no process holds it, rather than inventing a pid.
+- **It does not merge TCP and UDP into one answer.** They are separate namespaces:
+  a bind can fail on one and succeed on the other, so `-proto both` prints both
+  and names which one the exit code came from.
 - **It does not see other network namespaces.** Inside a container, a port held
   on the host is invisible. Every report now names the namespace it read, and says
   that a holder in another one cannot be ruled out — naming a namespace does not
@@ -404,13 +530,16 @@ Written down because the boundary is the product:
   diagnostic is the wrong place to hide a destructive action.
 - **It does not run on macOS or Windows.** `portwhy` exits with an explicit
   "socket tables are only available on Linux" rather than printing an empty
-  report. The binary compiles on those platforms so that cross-compilation and
-  `go vet` keep working; it refuses at runtime.
+  report, and `portwhy unix` does the same for `/proc/net/unix`. The binary
+  compiles on those platforms so that cross-compilation and `go vet` keep
+  working; it refuses at runtime.
 
 ## How it works
 
 ```
 /proc/net/tcp{,6}, /proc/net/udp{,6}   → internal/procnet   rows, addresses, states
+                                     (one state column, read per protocol)
+/proc/net/unix                         → internal/unixsock  names, socket type, SO_ACCEPTCON
 /proc/sys/net/ipv6/bindv6only          → internal/sysctl    does [::] also hold IPv4
 /proc/sys/net/ipv4/ip_local_port_range → internal/sysctl    may the kernel take this port
 /proc/sys/net/ipv4/ip_local_reserved_ports                   ...and was it excluded
@@ -418,15 +547,19 @@ Written down because the boundary is the product:
 /proc/self/ns/net, /proc/1/ns/net      → internal/netns     which namespace is this
 /proc/<pid>/fd/* → "socket:[inode]"    → internal/sockid    who holds which inode
 bind() twice, never listen()           → internal/probe     what the kernel does now
+lstat(path)                            → internal/unixsock  is something in the way
                         ↓
                   internal/verdict      classification, pure function
                         ↓
                   cmd/portwhy           text / JSON, exit codes
 ```
 
-Only `internal/procnet`, `internal/sysctl`, `internal/netns`, `internal/sockid` and
-`internal/probe` touch the system; `internal/verdict` is a pure function over rows
-and injected evidence, which is why the four causes above — and every way the probe
-or the tunable can contradict them — can be tested without opening a socket. See
-[docs/design.md](docs/design.md) for the decisions behind that split and the cases
-this version deliberately refuses to answer.
+Only `internal/procnet`, `internal/sysctl`, `internal/netns`, `internal/sockid`,
+`internal/unixsock` and `internal/probe` touch the system; `internal/verdict` is a
+pure function over rows and injected evidence, which is why the causes above — and
+every way the probe or the tunable can contradict them — can be tested without
+opening a socket. Walking a path is a measurement, so it happens outside the
+judgement and arrives as a three-state value: measured-present,
+measured-absent, or not measured at all. See [docs/design.md](docs/design.md) for
+the decisions behind that split and the cases this version deliberately refuses to
+answer.
