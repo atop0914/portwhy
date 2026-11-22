@@ -140,7 +140,7 @@ func runVersion(stdout, stderr io.Writer) int {
 func runWhy(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("why", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	proto := fs.String("proto", "tcp", "protocol to check: tcp or udp")
+	proto := fs.String("proto", "tcp", "protocol to check: tcp, udp or both")
 	asJSON := fs.Bool("json", false, "emit a JSON report instead of text")
 	tableDir := fs.String("tables", procnet.DefaultDir, "directory holding the kernel socket tables")
 	sysctlDir := fs.String("sysctl", sysctl.DefaultDir, "directory holding the kernel tunables")
@@ -158,7 +158,12 @@ func runWhy(args []string, stdout, stderr io.Writer) int {
 		return exitUsage
 	}
 
-	q, err := parseQuery(fs.Arg(0), *proto)
+	protos, err := parseProtos(*proto)
+	if err != nil {
+		_ = fprintf(stderr, "portwhy: %v\n", err)
+		return exitUsage
+	}
+	addr, err := parseTarget(fs.Arg(0))
 	if err != nil {
 		_ = fprintf(stderr, "portwhy: %v\n", err)
 		return exitUsage
@@ -167,10 +172,17 @@ func runWhy(args []string, stdout, stderr io.Writer) int {
 	// The probe answers the TCP question — "does bind() on this stream socket
 	// fail". A UDP probe would be a different experiment (no listener concept, no
 	// TIME_WAIT), so offering one today would mean reporting the result of one
-	// experiment as the answer to the other.
-	if *useProbe && q.Proto != procnet.TCP {
-		_ = fprintf(stderr, "portwhy: -probe is tcp only; a udp probe would answer a different question, "+
-			"so this version does not pretend to make one\n")
+	// experiment as the answer to the other. With -proto both there is no single
+	// experiment that answers both, which is why the combination is refused
+	// rather than quietly probing the TCP half.
+	if *useProbe && (len(protos) > 1 || protos[0] != procnet.TCP) {
+		if len(protos) > 1 {
+			_ = fprintf(stderr, "portwhy: -probe is tcp only, so it cannot answer -proto both: a udp probe "+
+				"is a different experiment, and probing just the tcp half would present one experiment as two answers\n")
+		} else {
+			_ = fprintf(stderr, "portwhy: -probe is tcp only; a udp probe would answer a different question, "+
+				"so this version does not pretend to make one\n")
+		}
 		return exitUsage
 	}
 
@@ -232,29 +244,55 @@ func runWhy(args []string, stdout, stderr io.Writer) int {
 	// is what lets the report say "the tables showed X, and a bind at time T
 	// said Y" without a reader having to guess which observation is newer.
 	if *useProbe {
-		env.Probe = probe.Both(netip.AddrPortFrom(q.Addr.IP, q.Addr.Port))
+		env.Probe = probe.Both(netip.AddrPortFrom(addr.IP, addr.Port))
 	}
 
 	// --all adds rows; it never re-decides. ExplainAll calls Explain and then
 	// attaches the neighbours, so the kind and the exit code cannot depend on the
 	// flag — that is a property of the code, not a promise in the help text.
-	var v verdict.Verdict
-	if *showAll {
-		v = verdict.ExplainAll(q, tables, env)
-	} else {
-		v = verdict.Explain(q, tables, env)
+	explain := func(q verdict.Query) verdict.Verdict {
+		if *showAll {
+			return verdict.ExplainAll(q, tables, env)
+		}
+		return verdict.Explain(q, tables, env)
 	}
 
+	if len(protos) == 1 {
+		v := explain(verdict.Query{Addr: addr, Proto: protos[0]})
+		if err := writeReport(stdout, v, *asJSON); err != nil {
+			_ = fprintf(stderr, "portwhy: writing report: %v\n", err)
+			return exitUsage
+		}
+		return exitCode(v.Kind)
+	}
+
+	// Two protocols, two answers. They are never folded into one kind: UDP 53
+	// taken while TCP 53 is free is the normal state of a DNS host, and a single
+	// kind would have to be wrong about one of them.
+	tcp := explain(verdict.Query{Addr: addr, Proto: procnet.TCP})
+	udp := explain(verdict.Query{Addr: addr, Proto: procnet.UDP})
 	if *asJSON {
-		err = renderJSON(stdout, v)
+		err = renderJSONBoth(stdout, tcp, udp)
 	} else {
-		err = renderText(stdout, v)
+		err = renderTextBoth(stdout, tcp, udp)
 	}
 	if err != nil {
 		_ = fprintf(stderr, "portwhy: writing report: %v\n", err)
 		return exitUsage
 	}
-	return exitCode(v.Kind)
+	// The exit-code contract predates this flag and has room for one answer. TCP
+	// wins, because "is this port taken" is a question people ask about a
+	// listener; the report prints the UDP answer and the code it would have had,
+	// so the choice is stated rather than hidden.
+	return exitCode(tcp.Kind)
+}
+
+// writeReport renders one verdict in the requested format.
+func writeReport(w io.Writer, v verdict.Verdict, asJSON bool) error {
+	if asJSON {
+		return renderJSON(w, v)
+	}
+	return renderText(w, v)
 }
 
 // splitFlags lets flags follow the target.
@@ -308,26 +346,22 @@ func exitCode(k verdict.Kind) int {
 	}
 }
 
-func parseQuery(target, proto string) (verdict.Query, error) {
-	p, err := parseProto(proto)
-	if err != nil {
-		return verdict.Query{}, err
-	}
-	addr, err := parseTarget(target)
-	if err != nil {
-		return verdict.Query{}, err
-	}
-	return verdict.Query{Addr: addr, Proto: p}, nil
-}
-
-func parseProto(s string) (procnet.Proto, error) {
+// parseProtos turns -proto into the protocols to answer for, in the order the
+// exit code prefers them.
+//
+// "both" is a request for two answers, not a third protocol. It returns them in
+// a fixed order rather than a set, because the exit code has to come from one of
+// them and a rule that depends on map iteration would flip between runs.
+func parseProtos(s string) ([]procnet.Proto, error) {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "tcp":
-		return procnet.TCP, nil
+		return []procnet.Proto{procnet.TCP}, nil
 	case "udp":
-		return procnet.UDP, nil
+		return []procnet.Proto{procnet.UDP}, nil
+	case "both":
+		return []procnet.Proto{procnet.TCP, procnet.UDP}, nil
 	}
-	return 0, fmt.Errorf("-proto %q is not tcp or udp", s)
+	return nil, fmt.Errorf("-proto %q is not tcp, udp or both", s)
 }
 
 // parseTarget accepts "host:port", "[v6]:port" and the bare ":port" that people
@@ -508,6 +542,33 @@ func renderText(w io.Writer, v verdict.Verdict) error {
 		}
 	}
 	return nil
+}
+
+// renderTextBoth prints two answers, each complete.
+//
+// Folding them would be the one thing this flag must not do: a DNS host has UDP
+// 53 taken and TCP 53 free, and a single kind would be a lie about one of them.
+// The exit code has to pick one, so the last line names both numbers instead of
+// letting a script believe the one it got covered both.
+func renderTextBoth(w io.Writer, tcp, udp verdict.Verdict) error {
+	if err := fprintf(w, "%s — two independent answers, one per protocol\n", tcp.Query.Addr); err != nil {
+		return err
+	}
+	if err := fprintf(w, "  a tcp bind and a udp bind are separate namespaces: one can fail while the\n"+
+		"  other succeeds, so neither answer is a summary of the other\n\n"); err != nil {
+		return err
+	}
+	if err := renderText(w, tcp); err != nil {
+		return err
+	}
+	if err := fprintf(w, "\n"); err != nil {
+		return err
+	}
+	if err := renderText(w, udp); err != nil {
+		return err
+	}
+	return fprintf(w, "\nexit code: %d, from the tcp answer; the udp answer alone would exit %d\n",
+		exitCode(tcp.Kind), exitCode(udp.Kind))
 }
 
 // renderScope names the network namespace the answer is about.
@@ -894,6 +955,43 @@ func jsonV6Only(b sysctl.BindV6Only) jsonBindV6Only {
 }
 
 func renderJSON(w io.Writer, v verdict.Verdict) error {
+	return encodeJSON(w, buildReport(v))
+}
+
+// renderJSONBoth keeps the two reports apart instead of merging their fields.
+//
+// A consumer that received one object with "kind: bound" and both protocols'
+// findings would have no way to tell which row belonged to which question. The
+// wrapper names the exit-code rule in the payload, so a script that only reads
+// JSON is told the same thing the text reader is.
+func renderJSONBoth(w io.Writer, tcp, udp verdict.Verdict) error {
+	return encodeJSON(w, struct {
+		Target   string     `json:"target"`
+		Both     bool       `json:"both"`
+		ExitFrom string     `json:"exit_from"`
+		TCP      jsonReport `json:"tcp"`
+		UDP      jsonReport `json:"udp"`
+	}{
+		Target:   tcp.Query.Addr.String(),
+		Both:     true,
+		ExitFrom: "tcp",
+		TCP:      buildReport(tcp),
+		UDP:      buildReport(udp),
+	})
+}
+
+func encodeJSON(w io.Writer, payload any) error {
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(payload); err != nil {
+		return fmt.Errorf("encode json: %w", err)
+	}
+	return nil
+}
+
+// buildReport turns one verdict into the JSON document. It is a separate function
+// because the two-protocol report embeds two of them.
+func buildReport(v verdict.Verdict) jsonReport {
 	rep := jsonReport{
 		Target:   v.Query.Addr.String(),
 		Proto:    v.Query.Proto.String(),
@@ -971,13 +1069,7 @@ func renderJSON(w io.Writer, v verdict.Verdict) error {
 	for _, r := range v.Reasons {
 		rep.Reasons = append(rep.Reasons, jsonReason{Code: r.Code, Detail: r.Detail})
 	}
-
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(rep); err != nil {
-		return fmt.Errorf("encode json: %w", err)
-	}
-	return nil
+	return rep
 }
 
 func usage(w io.Writer) error {
@@ -989,14 +1081,19 @@ usage
   portwhy version
 
 flags for "why"
-  -proto tcp|udp   protocol to check (default tcp)
+  -proto SPEC      tcp, udp or both (default tcp)
+                   both answers each protocol separately — a udp bind and a tcp
+                   bind are different namespaces — and never folds them into one
+                   kind. The exit code then reports the tcp answer; the udp
+                   answer and the code it would have had are printed too
   -json            machine-readable report
   -all             also list every row on this port, with why it did or did not
                    take part in the judgement (the judgement does not change)
   -probe           attempt a real bind() and report what the kernel answered:
                    one plain attempt and one with SO_REUSEADDR, never listen().
-                   tcp only. Exit code may become 3 where the tables had said
-                   free, because a refused bind disproves that answer
+                   tcp only, so it is a usage error together with -proto both.
+                   Exit code may become 3 where the tables had said free, because
+                   a refused bind disproves that answer
   -no-holders      skip the /proc/<pid>/fd walk
   -tables DIR      kernel socket table directory (default %s)
   -sysctl DIR      kernel tunable directory (default %s). Four are read:
@@ -1018,13 +1115,15 @@ every report states its scope
 
 exit codes
   0  free: nothing readable occupies it
-  1  taken: a listener, a TIME_WAIT reservation or another socket holds it
+  1  taken: a listener, a bound udp socket, a TIME_WAIT reservation or another
+     socket holds it, so a bind will fail
   2  usage or internal error
   3  unknown: the evidence needed was missing — this is not "free"
 
 example
   portwhy why 127.0.0.1:8080
   portwhy why :53 -proto udp -json
+  portwhy why :53 -proto both
   portwhy why :8080 -all
   portwhy why :8080 -probe
   portwhy states
