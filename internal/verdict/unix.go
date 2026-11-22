@@ -169,7 +169,7 @@ func explainUnixAbstract(v UnixVerdict, env UnixEnv) UnixVerdict {
 		v.Kind = KindBound
 		v.Reasons = append(v.Reasons, Reason{
 			Code:   ReasonUnixHolder,
-			Detail: fmt.Sprintf("%d row(s) in the unix table carry this name", len(v.Holders)),
+			Detail: fmt.Sprintf("%d row(s) in the unix table", len(v.Holders)),
 		})
 		v = unixOwnerCaveat(v, env)
 		return v
@@ -215,8 +215,11 @@ func explainUnixPath(v UnixVerdict, env UnixEnv) UnixVerdict {
 	case hasRow && path.Exists:
 		v.Kind = KindBound
 		v.Reasons = append(v.Reasons, Reason{
-			Code:   ReasonUnixHolder,
-			Detail: fmt.Sprintf("%d row(s) in the unix table; %s", len(v.Holders), path.Describe()),
+			Code: ReasonUnixHolder,
+			// The count is the measurement; what the path is belongs to the
+			// "path:" line of the report, and repeating it here would read as
+			// a second finding.
+			Detail: fmt.Sprintf("%d row(s) in the unix table", len(v.Holders)),
 		})
 		return unixOwnerCaveat(v, env)
 
@@ -226,9 +229,8 @@ func explainUnixPath(v UnixVerdict, env UnixEnv) UnixVerdict {
 		// old listener is unreachable rather than in the way.
 		v.Kind = KindFree
 		v.Reasons = append(v.Reasons, Reason{
-			Code: ReasonUnixNameReleased,
-			Detail: fmt.Sprintf("inode %d still cites this name in the unix table; the path itself does not exist",
-				v.Holders[0].Socket.Inode),
+			Code:   ReasonUnixNameReleased,
+			Detail: fmt.Sprintf("inode %d still cites this name", v.Holders[0].Socket.Inode),
 		})
 		return v
 
@@ -238,7 +240,7 @@ func explainUnixPath(v UnixVerdict, env UnixEnv) UnixVerdict {
 		v.Kind = KindStalePath
 		v.Reasons = append(v.Reasons, Reason{
 			Code:   ReasonUnixStaleSocket,
-			Detail: "the path is a socket file; no row in the unix table carries this name",
+			Detail: fmt.Sprintf("%d row(s) in the unix table", len(v.Holders)),
 		})
 		return v
 
@@ -246,15 +248,17 @@ func explainUnixPath(v UnixVerdict, env UnixEnv) UnixVerdict {
 		v.Kind = KindStalePath
 		v.Reasons = append(v.Reasons, Reason{
 			Code:   ReasonUnixNonSocketPath,
-			Detail: "the path exists and is a " + path.Kind,
+			Detail: fmt.Sprintf("%d row(s) in the unix table", len(v.Holders)),
 		})
 		return v
 	}
 
 	v.Kind = KindFree
 	v.Reasons = append(v.Reasons, Reason{
-		Code:   ReasonUnixAbsent,
-		Detail: "no row in the unix table carries this name; nothing exists at the path",
+		Code: ReasonUnixAbsent,
+		// No detail: this sentence already names both measurements (the table
+		// and the path), and the "path:" line prints the second one. Repeating
+		// them in a parenthetical stated the same fact three times.
 	})
 	return v
 }

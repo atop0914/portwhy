@@ -2,6 +2,7 @@ package verdict
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/atop0914/portwhy/internal/unixsock"
@@ -241,6 +242,102 @@ func TestUnixNamesMatchExactly(t *testing.T) {
 	v := askUnix("/run/app.sock", unixTable(unixSock("/run/app.sock", true)), UnixEnv{Path: path(true)})
 	if v.Kind != KindBound {
 		t.Fatalf("kind = %v, want bound for the row's own name", v.Kind)
+	}
+}
+
+// The report prints the path fact on its own "path:" line, so a reason detail
+// must not restate it. The same fact said twice does not read as emphasis, it
+// reads as two findings — the mistake this test was written after seeing in real
+// output, where a free answer said "nothing exists at the path" both in the
+// sentence and in its parenthetical.
+//
+// It also pins the details that do belong there: a count is a measurement the
+// sentence does not carry, and dropping every detail would satisfy the rule by
+// saying nothing.
+func TestUnixReasonDetailsDoNotRestateThePath(t *testing.T) {
+	regular := unixsock.PathState{Measured: true, Exists: true, Kind: "regular file"}
+	absent := unixsock.PathState{Measured: true}
+
+	cases := []struct {
+		name     string
+		v        UnixVerdict
+		detail   string
+		code     string
+		noDetail bool
+	}{
+		{
+			name:   "bound",
+			v:      askUnix("/run/app.sock", unixTable(unixSock("/run/app.sock", true)), UnixEnv{Path: path(true)}),
+			code:   ReasonUnixHolder,
+			detail: "1 row(s) in the unix table",
+		},
+		{
+			name:   "stale socket file",
+			v:      askUnix("/run/app.sock", unixTable(), UnixEnv{Path: path(true)}),
+			code:   ReasonUnixStaleSocket,
+			detail: "0 row(s) in the unix table",
+		},
+		{
+			name:   "not a socket",
+			v:      askUnix("/run/app.sock", unixTable(), UnixEnv{Path: regular}),
+			code:   ReasonUnixNonSocketPath,
+			detail: "0 row(s) in the unix table",
+		},
+		{
+			name:   "name released",
+			v:      askUnix("/run/app.sock", unixTable(unixSock("/run/app.sock", true)), UnixEnv{Path: absent}),
+			code:   ReasonUnixNameReleased,
+			detail: "inode 4242 still cites this name",
+		},
+		{
+			name:     "absent",
+			v:        askUnix("/run/app.sock", unixTable(), UnixEnv{Path: absent}),
+			code:     ReasonUnixAbsent,
+			noDetail: true,
+		},
+		{
+			// The abstract namespace has no path line, but it has the same rule:
+			// the count is the measurement and the sentence carries the rest.
+			name:   "abstract bound",
+			v:      askUnix("@app", unixTable(unixSock("@app", true)), UnixEnv{}),
+			code:   ReasonUnixHolder,
+			detail: "1 row(s) in the unix table",
+		},
+		{
+			name:     "abstract absent",
+			v:        askUnix("@app", unixTable(), UnixEnv{}),
+			code:     ReasonUnixAbstractAbsent,
+			noDetail: true,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var found *Reason
+			for i := range c.v.Reasons {
+				if c.v.Reasons[i].Code == c.code {
+					found = &c.v.Reasons[i]
+				}
+			}
+			if found == nil {
+				t.Fatalf("missing reason %s", c.code)
+			}
+			switch {
+			case c.noDetail && found.Detail != "":
+				t.Errorf("detail = %q, want none: the sentence and the path line already say it", found.Detail)
+			case !c.noDetail && found.Detail != c.detail:
+				t.Errorf("detail = %q, want %q", found.Detail, c.detail)
+			}
+			// The rule itself, applied to every reason on this answer, not just
+			// the one above: a new code must not reintroduce the duplication.
+			for _, r := range c.v.Reasons {
+				for _, banned := range []string{"path", "exist"} {
+					if strings.Contains(r.Detail, banned) {
+						t.Errorf("%s detail = %q, restates the path line", r.Code, r.Detail)
+					}
+				}
+			}
+		})
 	}
 }
 
