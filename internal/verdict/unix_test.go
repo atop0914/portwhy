@@ -200,14 +200,47 @@ func TestUnixAbstractAndPathDoNotCollide(t *testing.T) {
 
 // Names are matched exactly. A prefix rule would make "/run/app.sock" collide
 // with "/run/app.sock.old", which is a different socket and a different process.
+// A name is compared byte for byte, the way the kernel compares it. Prefix
+// matching is the tempting bug here — "/run/app.sock" and "/run/app.sock.old"
+// are two different sockets, and so are "/run/app" and "/run/app.sock".
+//
+// Every case keeps a socket file at the queried path, because that is what makes
+// a wrong match visible: with no file there, both a matched and an unmatched row
+// end in "free" and the assertion would pass for the wrong reason. With the file
+// present, an unmatched row must say stale-socket-file, while a wrongly matched
+// row would claim bound.
 func TestUnixNamesMatchExactly(t *testing.T) {
-	table := unixTable(unixSock("/run/app.sock.old", true))
-	if v := askUnix("/run/app.sock", table, UnixEnv{Path: unixsock.PathState{Measured: true}}); v.Kind != KindFree {
-		t.Fatalf("kind = %v, want free: a longer name is not this name", v.Kind)
+	cases := []struct {
+		name  string
+		table string
+		query string
+	}{
+		{"a longer name is not this name", "/run/app.sock.old", "/run/app.sock"},
+		{"a shorter name is not this name", "/run/app.sock", "/run/app"},
+		{"a sibling directory is not this name", "/run/other/app.sock", "/run/app.sock"},
+		{"the same suffix is not this name", "/run/app.sock", "/tmp/app.sock"},
 	}
-	table = unixTable(unixSock("/run/app.sock", true))
-	if v := askUnix("/run/app", table, UnixEnv{Path: unixsock.PathState{Measured: true}}); v.Kind != KindFree {
-		t.Fatalf("kind = %v, want free: a shorter name is not this name", v.Kind)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			v := askUnix(c.query, unixTable(unixSock(c.table, true)), UnixEnv{Path: path(true)})
+			if v.Kind != KindStalePath {
+				t.Fatalf("kind = %v, want stale-path: the row for %q does not hold %q", v.Kind, c.table, c.query)
+			}
+			if len(v.Holders) != 0 {
+				t.Errorf("holders = %+v, want none: %q was read as %q", v.Holders, c.table, c.query)
+			}
+			if hasUnixReason(v, ReasonUnixHolder) {
+				t.Error("a foreign row was reported as holding this name")
+			}
+		})
+	}
+
+	// The same table, queried with the name it actually carries, must still be
+	// bound — otherwise the cases above could pass because matching broke
+	// entirely rather than because it is exact.
+	v := askUnix("/run/app.sock", unixTable(unixSock("/run/app.sock", true)), UnixEnv{Path: path(true)})
+	if v.Kind != KindBound {
+		t.Fatalf("kind = %v, want bound for the row's own name", v.Kind)
 	}
 }
 
