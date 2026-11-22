@@ -44,17 +44,17 @@ func TestEveryKernelStateIsNamed(t *testing.T) {
 // them bind it — the false positive that ends trust in a diagnostic.
 func TestOnlyListenClaimsToBlockBind(t *testing.T) {
 	for _, s := range KnownStates() {
-		if got := s.Binding(); got == EffectBlocks && s != StateListen {
+		if got := s.BindingFor(TCP); got == EffectBlocks && s != StateListen {
 			t.Errorf("%v claims EffectBlocks; only LISTEN may", s)
 		}
 	}
-	if StateListen.Binding() != EffectBlocks {
-		t.Errorf("LISTEN binding = %v, want blocks", StateListen.Binding())
+	if StateListen.BindingFor(TCP) != EffectBlocks {
+		t.Errorf("LISTEN binding = %v, want blocks", StateListen.BindingFor(TCP))
 	}
 	// The reverse: a TIME_WAIT reservation is real, so it must not be dismissed
 	// as already released.
-	if StateTimeWait.Binding() != EffectOptionsDecide {
-		t.Errorf("TIME_WAIT binding = %v, want options-decide", StateTimeWait.Binding())
+	if StateTimeWait.BindingFor(TCP) != EffectOptionsDecide {
+		t.Errorf("TIME_WAIT binding = %v, want options-decide", StateTimeWait.BindingFor(TCP))
 	}
 }
 
@@ -63,11 +63,14 @@ func TestUnrecognisedStateIsNotGuessed(t *testing.T) {
 		if got := code.String(); !strings.HasPrefix(got, "UNKNOWN(0x") {
 			t.Errorf("state 0x%02x prints %q, want UNKNOWN(0x..)", uint8(code), got)
 		}
-		if got := code.Binding(); got != EffectUnknown {
+		if got := code.BindingFor(TCP); got != EffectUnknown {
 			t.Errorf("state 0x%02x binding = %v, want unknown (a guess here becomes a confident wrong answer)", uint8(code), got)
 		}
-		if got := code.Note(); got != "" {
+		if got := code.NoteFor(TCP); got != "" {
 			t.Errorf("state 0x%02x has a note %q, but nothing is known about it", uint8(code), got)
+		}
+		if got := code.NoteFor(UDP); got != "" {
+			t.Errorf("state 0x%02x has a udp note %q, but nothing is known about it", uint8(code), got)
 		}
 	}
 }
@@ -76,10 +79,10 @@ func TestUnrecognisedStateIsNotGuessed(t *testing.T) {
 // cannot say what it means is a table of codes, not semantics.
 func TestEveryStateExplainsItself(t *testing.T) {
 	for _, s := range KnownStates() {
-		if strings.TrimSpace(s.Note()) == "" {
+		if strings.TrimSpace(s.NoteFor(TCP)) == "" {
 			t.Errorf("%v has no note", s)
 		}
-		if s.Binding() == EffectUnknown {
+		if s.BindingFor(TCP) == EffectUnknown {
 			t.Errorf("%v is in the table but its binding effect is unknown", s)
 		}
 	}

@@ -34,6 +34,13 @@ const (
 	KindFree Kind = "free"
 	// KindListening means a socket in LISTEN holds the address.
 	KindListening Kind = "listening"
+	// KindBound means a socket holds the address without a listening state, and
+	// is the answer for every UDP question: a bound UDP socket has no LISTEN
+	// state, but it makes a second plain bind() fail with EADDRINUSE. It is a
+	// separate kind because the sentence "a listening socket holds it" would be
+	// false — UDP never listens — and a report whose words do not match the
+	// protocol is a report a user has to translate.
+	KindBound Kind = "bound"
 	// KindTimeWaitOnly means only TIME_WAIT rows hold it: a different problem
 	// with a different fix, which is why it is not folded into KindListening.
 	KindTimeWaitOnly Kind = "time-wait-only"
@@ -50,8 +57,13 @@ const (
 // Reason codes. The CLI turns them into sentences; tests assert on the codes so
 // that changing wording never quietly changes meaning.
 const (
-	ReasonNoSockets       = "no-sockets-found"
-	ReasonListener        = "listener-holds-address"
+	ReasonNoSockets = "no-sockets-found"
+	ReasonListener  = "listener-holds-address"
+	// ReasonBound is the UDP counterpart of ReasonListener. It is not the same
+	// sentence: a bound datagram socket holds the address without listening, and
+	// the fix (find the process, or agree on SO_REUSEADDR) is the same only by
+	// accident.
+	ReasonBound           = "socket-bound-to-address"
 	ReasonTimeWait        = "only-time-wait-rows"
 	ReasonOtherState      = "non-listening-state"
 	ReasonTableUnreadable = "table-unreadable"
@@ -365,7 +377,7 @@ func Explain(q Query, tables []procnet.Table, env Env) Verdict {
 			if !occupies(s, q) {
 				continue
 			}
-			if s.State.Binding() == procnet.EffectTeardown {
+			if s.Binding() == procnet.EffectTeardown {
 				released = append(released, s)
 				continue
 			}
@@ -396,6 +408,8 @@ func Explain(q Query, tables []procnet.Table, env Env) Verdict {
 	switch v.Kind {
 	case KindListening:
 		v.Reasons = append(v.Reasons, Reason{Code: ReasonListener})
+	case KindBound:
+		v.Reasons = append(v.Reasons, Reason{Code: ReasonBound})
 	case KindTimeWaitOnly:
 		v.Reasons = append(v.Reasons, Reason{Code: ReasonTimeWait})
 	case KindOccupiedNonListening:
@@ -418,8 +432,13 @@ func Explain(q Query, tables []procnet.Table, env Env) Verdict {
 		}
 		// The one answer this blind spot can invalidate, so it is stated here
 		// and nowhere else: a caveat that appears on every report stops being
-		// read.
-		v.Reasons = append(v.Reasons, Reason{Code: ReasonUnlistedBinding})
+		// read. It is a TCP-only property — it describes a socket that called
+		// bind() and never listen() — and UDP has no listen() to skip, so a
+		// caveat there would describe a hole that cannot exist. A bound UDP
+		// socket is in /proc/net/udp, verified on a live kernel.
+		if q.Proto == procnet.TCP {
+			v.Reasons = append(v.Reasons, Reason{Code: ReasonUnlistedBinding})
+		}
 	}
 
 	if len(released) > 0 {
@@ -484,7 +503,7 @@ func foldV6Wildcard(v Verdict, shadow procnet.Socket, env Env) Verdict {
 			Code:   ReasonV6Wildcard,
 			Detail: fmt.Sprintf("%s is a listening %s wildcard on this port; %s", shadow.Local, shadow.Family, env.V6Only.Describe()),
 		})
-		if v.Kind != KindListening {
+		if v.Kind != KindListening && v.Kind != KindBound {
 			v.Kind = KindUnknown
 		}
 	case env.V6Only.DualStack():
@@ -494,7 +513,14 @@ func foldV6Wildcard(v Verdict, shadow procnet.Socket, env Env) Verdict {
 		}
 		v.Findings = append(v.Findings, f)
 		sortFindings(v.Findings)
-		v.Kind = KindListening
+		// The wildcard is a holder now, and the kind has to use the word that
+		// matches the protocol: a TCP [::] socket is listening, a UDP one is
+		// bound and never listens.
+		if shadow.Proto == procnet.UDP {
+			v.Kind = KindBound
+		} else {
+			v.Kind = KindListening
+		}
 		v.Reasons = append(v.Reasons,
 			Reason{
 				Code:   ReasonV6Shadow,
@@ -955,16 +981,22 @@ func (v *Verdict) dropReason(code string) {
 // outright and no other row can weaken that; an unrecognised state code is a hole
 // in the evidence and must not be folded into "occupied"; TIME_WAIT and nothing
 // else is its own diagnosis because its fix is different from a live socket's.
+//
+// "Blocks" splits by protocol, and the split is not cosmetic: a TCP row in that
+// bucket is a listener, a UDP row is a bound socket, and the two need different
+// sentences. A UDP row can never claim KindListening — there is no such state —
+// and a TCP row never claims KindBound.
 func classify(findings []Finding) (Kind, []procnet.State) {
 	var (
 		unrecognised []procnet.State
 		listening    bool
+		bound        bool
 		occupied     bool
 		considered   int
 	)
 	onlyTimeWait := true
 	for _, f := range findings {
-		switch effect := f.Socket.State.Binding(); effect {
+		switch effect := f.Socket.Binding(); effect {
 		case procnet.EffectTeardown:
 			// Explain drops these before classifying. Skipping here too means a
 			// released row can never be counted as occupation by any caller — and
@@ -972,7 +1004,11 @@ func classify(findings []Finding) (Kind, []procnet.State) {
 			// only of released rows does not become "only TIME_WAIT".
 			continue
 		case procnet.EffectBlocks:
-			listening = true
+			if f.Socket.Proto == procnet.UDP {
+				bound = true
+			} else {
+				listening = true
+			}
 		case procnet.EffectOptionsDecide:
 			occupied = true
 		default:
@@ -986,6 +1022,8 @@ func classify(findings []Finding) (Kind, []procnet.State) {
 	switch {
 	case listening:
 		return KindListening, nil
+	case bound:
+		return KindBound, nil
 	case len(unrecognised) > 0:
 		return KindUnknown, unrecognised
 	case considered > 0 && onlyTimeWait:
@@ -1054,8 +1092,15 @@ func sameFamily(a, b netip.Addr) bool {
 	return a.IsValid() && b.IsValid() && a.Is4() == b.Is4()
 }
 
-// v6WildcardShadow finds an IPv6 wildcard listener on the queried port when the
+// v6WildcardShadow finds an IPv6 wildcard socket on the queried port when the
 // question is about IPv4.
+//
+// "Wildcard" is read through the row's own protocol: the row has to be one that
+// blocks a plain bind in its own vocabulary. For TCP that is LISTEN and nothing
+// else; for UDP it is any bound socket, because UDP has no listening state and
+// every bound socket is in the blocks bucket. Checking for LISTEN alone would
+// have missed a dual-stack UDP6 wildcard, and a free answer that misses a holder
+// is the one failure this tool cannot afford.
 func v6WildcardShadow(q Query, tables []procnet.Table) *procnet.Socket {
 	if !q.Addr.IP.Is4() {
 		return nil
@@ -1065,7 +1110,7 @@ func v6WildcardShadow(q Query, tables []procnet.Table) *procnet.Socket {
 			continue
 		}
 		for _, s := range t.Sockets {
-			if s.State == procnet.StateListen && s.Local.Port == q.Addr.Port && s.Local.IsWildcard() {
+			if s.Binding() == procnet.EffectBlocks && s.Local.Port == q.Addr.Port && s.Local.IsWildcard() {
 				shadow := s
 				return &shadow
 			}

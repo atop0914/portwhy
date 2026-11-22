@@ -127,7 +127,7 @@ func TestTimeWaitIsReservationNotTeardown(t *testing.T) {
 // point of the table is that the twelve codes behave predictably.
 func TestEveryBoundStateClassifiesAsOccupation(t *testing.T) {
 	for _, s := range procnet.KnownStates() {
-		switch s.Binding() {
+		switch s.BindingFor(procnet.TCP) {
 		case procnet.EffectOptionsDecide:
 			tables := []procnet.Table{table("tcp", procnet.TCP, procnet.V4,
 				sock(s, "127.0.0.1", 8080, procnet.TCP))}

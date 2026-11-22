@@ -111,15 +111,16 @@ func matchCode(s procnet.Socket, q Query) MatchCode {
 	case s.Proto != q.Proto:
 		return MatchOtherProto
 	case !sameFamily(s.Local.IP, q.Addr.IP):
-		// A [::] listener is the only row from the other family that can matter:
-		// with bindv6only=0 it occupies IPv4 too. The mirror does not hold — a
-		// 0.0.0.0 listener never occupies an IPv6 address.
-		if s.State == procnet.StateListen && s.Local.IsWildcard() && q.Addr.IP.Is4() {
+		// A [::] holder is the only row from the other family that can matter:
+		// with bindv6only=0 it occupies IPv4 too. "Holder" is read through the
+		// row's protocol — on TCP that means LISTEN, on UDP any bound socket —
+		// so the same rule covers both tables instead of only the stream one.
+		if s.Binding() == procnet.EffectBlocks && s.Local.IsWildcard() && q.Addr.IP.Is4() {
 			return MatchWildcardShadowed
 		}
 		return MatchOtherFamily
 	case addressCovers(s.Local, q.Addr):
-		if s.State.Binding() == procnet.EffectTeardown {
+		if s.Binding() == procnet.EffectTeardown {
 			return MatchReleased
 		}
 		return MatchMatched

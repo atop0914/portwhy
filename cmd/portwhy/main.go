@@ -61,8 +61,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 }
 
-// runStates prints the state vocabulary: every TCP state the kernel can report,
-// with what it does to a bind().
+// runStates prints the state vocabulary: every state the kernel can report, with
+// what it does to a bind() — in both protocols, because the same number does not
+// mean the same thing in /proc/net/tcp and /proc/net/udp.
 //
 // It is a command rather than documentation because the table is the product.
 // Anyone who disagrees with a judgement can read the rule that produced it
@@ -77,13 +78,14 @@ func runStates(args []string, stdout, stderr io.Writer) int {
 		_ = fprintf(stderr, "portwhy: %v\n", err)
 		return exitUsage
 	}
-	if err := fprintf(stdout, "  %-6s %-14s %-15s %s\n", "code", "name", "bind effect", "what it means"); err != nil {
+	if err := fprintf(stdout, "  %-6s %-14s %-11s %-11s %s\n",
+		"code", "name", "tcp effect", "udp effect", "what it means for a stream socket"); err != nil {
 		_ = fprintf(stderr, "portwhy: %v\n", err)
 		return exitUsage
 	}
 	for _, s := range procnet.KnownStates() {
-		if err := fprintf(stdout, "  0x%02x   %-14s %-15s %s\n",
-			uint8(s), s.String(), s.Binding(), s.Note()); err != nil {
+		if err := fprintf(stdout, "  0x%02x   %-14s %-11s %-11s %s\n",
+			uint8(s), s.String(), s.BindingFor(procnet.TCP), effectOrDash(s, procnet.UDP), s.NoteFor(procnet.TCP)); err != nil {
 			_ = fprintf(stderr, "portwhy: %v\n", err)
 			return exitUsage
 		}
@@ -95,7 +97,36 @@ func runStates(args []string, stdout, stderr io.Writer) int {
 		_ = fprintf(stderr, "portwhy: %v\n", err)
 		return exitUsage
 	}
+
+	if err := fprintf(stdout, "\nUDP states, as /proc/net/udp uses the same column\n\n"); err != nil {
+		_ = fprintf(stderr, "portwhy: %v\n", err)
+		return exitUsage
+	}
+	for _, s := range procnet.KnownUDPStates() {
+		if err := fprintf(stdout, "  0x%02x   %-14s %-11s %s\n",
+			uint8(s), s.String(), s.BindingFor(procnet.UDP), s.NoteFor(procnet.UDP)); err != nil {
+			_ = fprintf(stderr, "portwhy: %v\n", err)
+			return exitUsage
+		}
+	}
+	if err := fprintf(stdout,
+		"\n  only these two codes occur in a UDP table, and 0x07 is the important one:\n"+
+			"  it means bound-and-unconnected, the ordinary state of a bound UDP socket,\n"+
+			"  and a second plain bind() fails with EADDRINUSE while it exists. Read\n"+
+			"  through the TCP table it would look like a socket already released.\n"); err != nil {
+		_ = fprintf(stderr, "portwhy: %v\n", err)
+		return exitUsage
+	}
 	return exitFree
+}
+
+// effectOrDash prints a binding effect, or "-" for a code the protocol does not
+// use. A zero value here would read as EffectUnknown, which is a claim.
+func effectOrDash(s procnet.State, p procnet.Proto) string {
+	if s.BindingFor(p) == procnet.EffectUnknown {
+		return "-"
+	}
+	return s.BindingFor(p).String()
 }
 
 func runVersion(stdout, stderr io.Writer) int {
@@ -326,6 +357,7 @@ func parseTarget(s string) (procnet.Addr, error) {
 var kindSentence = map[verdict.Kind]string{
 	verdict.KindFree:                 "nothing in the kernel tables occupies it",
 	verdict.KindListening:            "a listening socket holds it",
+	verdict.KindBound:                "a bound socket holds it (udp has no listening state)",
 	verdict.KindTimeWaitOnly:         "only TIME_WAIT rows hold it",
 	verdict.KindOccupiedNonListening: "sockets hold it, but none of them is listening",
 	verdict.KindUnknown:              "cannot be determined from what was readable",
@@ -334,13 +366,14 @@ var kindSentence = map[verdict.Kind]string{
 var reasonSentence = map[string]string{
 	verdict.ReasonNoSockets:              "no row in the read tables matches this address",
 	verdict.ReasonListener:               "bind() to an address a listener holds fails with EADDRINUSE",
+	verdict.ReasonBound:                  "a UDP socket is bound to this address and keeps the port to itself: a second plain bind() fails with EADDRINUSE, and the fix is to find that process — or, if both sides agree to it, to share the port with SO_REUSEADDR",
 	verdict.ReasonTimeWait:               "the reservation belongs to a closed connection, not to a running process",
 	verdict.ReasonOtherState:             "a bound socket in a non-listening state holds this address; whether bind() fails depends on socket options",
 	verdict.ReasonTableUnreadable:        "a socket table could not be read, so absence of a row proves nothing",
-	verdict.ReasonV6Wildcard:             "whether the IPv6 wildcard listener also holds this IPv4 address could not be answered: net.ipv6.bindv6only was not readable, and a default is not a measurement",
-	verdict.ReasonV6Shadow:               "the IPv6 wildcard listener holds this IPv4 address too: this host runs with bindv6only=0, so a [::] socket is dual-stack",
-	verdict.ReasonV6NoShadow:             "the IPv6 wildcard listener does not hold this IPv4 address: this host runs with bindv6only=1, so [::] is IPv6 only",
-	verdict.ReasonV6PerSocket:            "bindv6only is the default for new sockets, not a property of an existing one: a listener that set IPV6_V6ONLY for itself would leave IPv4 free, and only -probe can tell which",
+	verdict.ReasonV6Wildcard:             "whether the IPv6 wildcard socket also holds this IPv4 address could not be answered: net.ipv6.bindv6only was not readable, and a default is not a measurement",
+	verdict.ReasonV6Shadow:               "the IPv6 wildcard socket holds this IPv4 address too: this host runs with bindv6only=0, so a [::] socket is dual-stack",
+	verdict.ReasonV6NoShadow:             "the IPv6 wildcard socket does not hold this IPv4 address: this host runs with bindv6only=1, so [::] is IPv6 only",
+	verdict.ReasonV6PerSocket:            "bindv6only is the default for new sockets, not a property of an existing one: a socket that set IPV6_V6ONLY for itself would leave IPv4 free, and only -probe can tell which",
 	verdict.ReasonV6OptOut:               "the wildcard looked dual-stack but a bind succeeded: that listener is IPv6-only for itself, an option the kernel reports nowhere, so this version does not promote the answer to free",
 	verdict.ReasonNoOwnerInode:           "a row with inode 0 has no descriptor behind it (TIME_WAIT, or a socket closed and waiting out its timeout), so no process can be named for it",
 	verdict.ReasonProcsDenied:            "some processes could not be read, so an unnamed holder may exist",
@@ -886,7 +919,7 @@ func renderJSON(w io.Writer, v verdict.Verdict) error {
 	for _, f := range v.Findings {
 		jf := jsonFinding{
 			State:  f.Socket.State.String(),
-			Effect: f.Socket.State.Binding().String(),
+			Effect: f.Socket.Binding().String(),
 			Local:  f.Socket.Local.String(),
 			Inode:  f.Socket.Inode,
 			Table:  f.Socket.Table,
@@ -903,7 +936,7 @@ func renderJSON(w io.Writer, v verdict.Verdict) error {
 			jr := jsonRow{
 				Match:  string(r.Match),
 				State:  r.Socket.State.String(),
-				Effect: r.Socket.State.Binding().String(),
+				Effect: r.Socket.Binding().String(),
 				Local:  r.Socket.Local.String(),
 				Inode:  r.Socket.Inode,
 				Table:  r.Socket.Table,

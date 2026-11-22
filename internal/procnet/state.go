@@ -96,6 +96,26 @@ var stateTable = map[State]stateInfo{
 		note: "a request socket from a SYN that the listener has not accepted yet"},
 }
 
+// udpStateTable is the UDP reading of the same column.
+//
+// It is a separate table rather than a patch on the TCP one because UDP has no
+// connection state machine: there is no LISTEN, no TIME_WAIT and nothing to
+// tear down. Two values occur, both verified against a live kernel:
+//
+//   - 0x07 CLOSE: bound and unconnected. Every bound UDP socket looks like this.
+//   - 0x01 ESTABLISHED: connect()ed to a peer, so the local port stays bound.
+//
+// Both block a plain bind(). A socket that set SO_REUSEADDR can share the port
+// with another that did too — the same "the option changes the answer" case as
+// LISTEN with SO_REUSEPORT, which is why the note says so rather than the
+// judgement pretending the option does not exist.
+var udpStateTable = map[State]stateInfo{
+	StateClose: {name: "CLOSE", effect: EffectBlocks,
+		note: "bound and not connected — the ordinary state of a bound UDP socket; a plain bind() fails meanwhile"},
+	StateEstablished: {name: "ESTABLISHED", effect: EffectBlocks,
+		note: "connect()ed to a peer, so the local port stays bound and a plain bind() fails"},
+}
+
 // String names the state, and names the codes this build does not know as
 // UNKNOWN(0x..): a reader must be able to tell "a state I do not understand"
 // from "a state I understand, and it is CLOSE".
@@ -106,18 +126,51 @@ func (s State) String() string {
 	return fmt.Sprintf("UNKNOWN(0x%02x)", uint8(s))
 }
 
-// Binding is the bind() consequence of a row in this state. An unrecognised code
-// answers EffectUnknown rather than the most common effect: guessing here is what
-// turns "I do not know" into a confident wrong answer.
-func (s State) Binding() BindEffect {
-	if info, ok := stateTable[s]; ok {
-		return info.effect
+// BindingFor is the bind() consequence of a row in this state, read in the
+// vocabulary of one protocol.
+//
+// The two vocabularies are not the same and must not be merged. /proc/net/udp
+// uses the same numeric column as /proc/net/tcp, but only two of its values
+// occur, and one of them means the opposite of what it means for a stream
+// socket: st=07 (CLOSE) is a UDP socket that is bound and not connected — the
+// normal state of any bound UDP socket, and one that makes a second bind() fail
+// with EADDRINUSE. Read through the TCP table it is "already released", which
+// would turn a port that is definitely taken into "free".
+//
+// An unrecognised code answers EffectUnknown rather than the most common effect:
+// guessing here is what turns "I do not know" into a confident wrong answer.
+func (s State) BindingFor(proto Proto) BindEffect {
+	switch proto {
+	case TCP:
+		if info, ok := stateTable[s]; ok {
+			return info.effect
+		}
+	case UDP:
+		if info, ok := udpStateTable[s]; ok {
+			return info.effect
+		}
 	}
 	return EffectUnknown
 }
 
-// Note is the one-clause explanation, empty for an unrecognised code.
-func (s State) Note() string { return stateTable[s].note }
+// NoteFor is the one-clause explanation in one protocol's vocabulary, empty for
+// a code that protocol does not use.
+func (s State) NoteFor(proto Proto) string {
+	switch proto {
+	case TCP:
+		return stateTable[s].note
+	case UDP:
+		return udpStateTable[s].note
+	}
+	return ""
+}
+
+// Binding is the bind() consequence of this row, read through the protocol the
+// row itself carries.
+//
+// Callers must use this rather than State.BindingFor: a row knows which table it
+// came from, and the same state number means different things in the two.
+func (s Socket) Binding() BindEffect { return s.State.BindingFor(s.Proto) }
 
 // KnownStates lists every state this build names, in numeric order.
 //
@@ -127,6 +180,20 @@ func (s State) Note() string { return stateTable[s].note }
 func KnownStates() []State {
 	out := make([]State, 0, len(stateTable))
 	for s := range stateTable {
+		out = append(out, s)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+// KnownUDPStates lists the codes /proc/net/udp can carry, in numeric order.
+//
+// It is short on purpose. Printing the TCP vocabulary next to a UDP answer would
+// suggest that a UDP socket can be in LISTEN or TIME_WAIT, and a reader who
+// believed that would look for a state that cannot exist.
+func KnownUDPStates() []State {
+	out := make([]State, 0, len(udpStateTable))
+	for s := range udpStateTable {
 		out = append(out, s)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
