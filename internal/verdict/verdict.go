@@ -41,6 +41,12 @@ const (
 	// false — UDP never listens — and a report whose words do not match the
 	// protocol is a report a user has to translate.
 	KindBound Kind = "bound"
+	// KindStalePath means a unix socket name is in the way without a socket
+	// holding it: the file is there, the table has no row, and bind() still fails
+	// with EADDRINUSE. It is not "taken" in the sense the other kinds use — no
+	// process holds anything — but it is not free either, and a script that read
+	// this as free would try a bind that cannot work.
+	KindStalePath Kind = "stale-path"
 	// KindTimeWaitOnly means only TIME_WAIT rows hold it: a different problem
 	// with a different fix, which is why it is not folded into KindListening.
 	KindTimeWaitOnly Kind = "time-wait-only"

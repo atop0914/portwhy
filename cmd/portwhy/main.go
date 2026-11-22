@@ -22,6 +22,7 @@ import (
 	"github.com/atop0914/portwhy/internal/procnet"
 	"github.com/atop0914/portwhy/internal/sockid"
 	"github.com/atop0914/portwhy/internal/sysctl"
+	"github.com/atop0914/portwhy/internal/unixsock"
 	"github.com/atop0914/portwhy/internal/verdict"
 	"github.com/atop0914/portwhy/internal/version"
 )
@@ -47,6 +48,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	switch args[0] {
 	case "why":
 		return runWhy(args[1:], stdout, stderr)
+	case "unix":
+		return runUnix(args[1:], stdout, stderr)
 	case "states":
 		return runStates(args[1:], stdout, stderr)
 	case "version", "--version":
@@ -295,6 +298,77 @@ func writeReport(w io.Writer, v verdict.Verdict, asJSON bool) error {
 	return renderText(w, v)
 }
 
+// runUnix answers "why can't I bind this unix socket name".
+//
+// It is a separate command rather than a flag on why: a unix socket has no port,
+// no protocol and no TIME_WAIT, and the flags that make sense for a port (proto,
+// probe, the port-pool tunables) would all have to be rejected one by one.
+func runUnix(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("unix", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	asJSON := fs.Bool("json", false, "emit a JSON report instead of text")
+	tableDir := fs.String("tables", unixsock.DefaultDir, "directory holding the kernel socket tables")
+	procRoot := fs.String("proc", sockid.DefaultRoot, "procfs root used to name the holder")
+	skipHolders := fs.Bool("no-holders", false, "do not walk /proc/<pid>/fd: kernel state only")
+
+	if err := fs.Parse(splitFlags(fs, args)); err != nil {
+		return exitUsage
+	}
+	if fs.NArg() != 1 {
+		_ = fprintf(stderr, "portwhy: unix takes exactly one name, got %d\n\n", fs.NArg())
+		_ = usage(stderr)
+		return exitUsage
+	}
+
+	q := verdict.UnixNameOf(fs.Arg(0))
+	if q.Name == "" {
+		_ = fprintf(stderr, "portwhy: empty unix socket name\n\n")
+		_ = usage(stderr)
+		return exitUsage
+	}
+
+	table := unixsock.Read(*tableDir)
+
+	env := verdict.UnixEnv{}
+	// An abstract name has no filesystem entry, so nothing is inspected: asking
+	// the filesystem about "@foo" would answer about a file named "@foo", which
+	// is a different socket entirely.
+	if !q.Abstract {
+		env.Path = unixsock.Inspect(q.Name)
+	}
+	if !*skipHolders {
+		idx, err := sockid.Scan(*procRoot)
+		if err != nil {
+			_ = fprintf(stderr, "portwhy: warning: cannot name holders: %v\n", err)
+		} else {
+			env.Lookup = func(inode uint64) []verdict.Owner {
+				holders := idx.Holders(inode)
+				out := make([]verdict.Owner, 0, len(holders))
+				for _, h := range holders {
+					out = append(out, verdict.Owner{PID: h.PID, Comm: h.Comm, FD: h.FD})
+				}
+				return out
+			}
+			env.ProcsRead = idx.ProcsRead
+			env.ProcsDenied = idx.ProcsDenied
+			env.PPID = idx.PPID
+		}
+	}
+
+	v := verdict.ExplainUnix(q, table, env)
+	var err error
+	if *asJSON {
+		err = renderUnixJSON(stdout, v)
+	} else {
+		err = renderUnixText(stdout, v)
+	}
+	if err != nil {
+		_ = fprintf(stderr, "portwhy: writing report: %v\n", err)
+		return exitUsage
+	}
+	return exitCode(v.Kind)
+}
+
 // splitFlags lets flags follow the target.
 //
 // The standard flag package stops at the first positional argument, so
@@ -397,6 +471,15 @@ var kindSentence = map[verdict.Kind]string{
 	verdict.KindUnknown:              "cannot be determined from what was readable",
 }
 
+// unixKindSentence is the same set of answers in a different vocabulary: a unix
+// socket name is not a port, and "stale-path" has no port equivalent at all.
+var unixKindSentence = map[verdict.Kind]string{
+	verdict.KindFree:      "nothing holds this name",
+	verdict.KindBound:     "a socket is bound to this name",
+	verdict.KindStalePath: "the name is in the way, but no running socket holds it",
+	verdict.KindUnknown:   "cannot be determined from what was readable",
+}
+
 var reasonSentence = map[string]string{
 	verdict.ReasonNoSockets:              "no row in the read tables matches this address",
 	verdict.ReasonListener:               "bind() to an address a listener holds fails with EADDRINUSE",
@@ -428,6 +511,14 @@ var reasonSentence = map[string]string{
 	verdict.ReasonHolderLookupIncomplete: "not every process could be read, so this answer was never checked against all of them: an unreadable one may hold the port",
 	verdict.ReasonPrivilegedPort:         "binding this port needs a capability this process may not have: it is below the boundary this host measured, so a bind is refused with EACCES before the address is even considered — that refusal is not a holder",
 	verdict.ReasonPrivilegedUnreadable:   "the privileged-port boundary could not be read, so whether this port needs root at all was not measured — the traditional limit is not a measurement of this host",
+	verdict.ReasonUnixHolder:             "a socket in the kernel table carries this name, so bind() fails with EADDRINUSE",
+	verdict.ReasonUnixStaleSocket:        "the socket file is still there and no process holds it: bind() keeps failing until that file is removed, and looking for a process to kill will find nothing",
+	verdict.ReasonUnixNonSocketPath:      "something that is not a unix socket occupies this path: bind() fails with EADDRINUSE on any existing entry, so the path has to be removed or chosen differently",
+	verdict.ReasonUnixNameReleased:       "the name is free even though the table still shows a socket: the file was removed while that socket stayed open, so a new bind() creates a new file and leaves the old socket unreachable",
+	verdict.ReasonUnixAbsent:             "both halves were checked: no row in the unix table carries this name and nothing exists at the path",
+	verdict.ReasonUnixAbstractAbsent:     "no socket in the kernel carries this abstract name, so a bind can take it; a name in this namespace disappears with its socket and leaves nothing behind",
+	verdict.ReasonUnixTableUnreadable:    "the unix socket table could not be read, so absence of a row proves nothing about this name",
+	verdict.ReasonUnixPathUnreadable:     "the path could not be checked, so whether something is in the way was never measured — this is not a free name",
 }
 
 // limitReasons are the ones that describe what the answer does not cover. They
@@ -569,6 +660,169 @@ func renderTextBoth(w io.Writer, tcp, udp verdict.Verdict) error {
 	}
 	return fprintf(w, "\nexit code: %d, from the tcp answer; the udp answer alone would exit %d\n",
 		exitCode(tcp.Kind), exitCode(udp.Kind))
+}
+
+// renderUnixText prints a unix socket answer.
+//
+// The path line comes before the diagnosis for the same reason the namespace line
+// does: "nothing holds this name" is a claim about two things — the kernel table
+// and the filesystem — and a reader who has already decided what it means will
+// not scroll back to find out which of them was checked.
+func renderUnixText(w io.Writer, v verdict.UnixVerdict) error {
+	kindText, ok := unixKindSentence[v.Kind]
+	if !ok {
+		kindText = string(v.Kind)
+	}
+	if err := fprintf(w, "%s — %s\n", v.Query.Name, kindText); err != nil {
+		return err
+	}
+	if v.Query.Abstract {
+		if err := fprintf(w, "scope: abstract namespace — the name lives in the kernel; "+
+			"no file exists for it, so nothing about a path was measured\n"); err != nil {
+			return err
+		}
+	} else if err := fprintf(w, "path: %s\n", v.Path.Line()); err != nil {
+		return err
+	}
+
+	if len(v.Holders) > 0 {
+		if err := fprintf(w, "\nholders\n"); err != nil {
+			return err
+		}
+		for _, h := range v.Holders {
+			// "bound" and "listening" are the two states a unix name can be
+			// held in, and the difference decides whether anything can still
+			// connect to it — so it is printed rather than folded away.
+			state := "bound"
+			if h.Socket.Listening() {
+				state = "listening"
+			}
+			if err := fprintf(w, "  %-10s %-10s inode %-10d %s\n",
+				h.Socket.Type, state, h.Socket.Inode, ownerText(h.Owners, h.Socket.Inode)); err != nil {
+				return err
+			}
+		}
+	}
+
+	if err := fprintf(w, "\nwhy\n"); err != nil {
+		return err
+	}
+	wrote := false
+	for _, r := range v.Reasons {
+		if limitReasons[r.Code] {
+			continue
+		}
+		if err := writeReason(w, r); err != nil {
+			return err
+		}
+		wrote = true
+	}
+	if !wrote {
+		if err := fprintf(w, "  - no further detail available\n"); err != nil {
+			return err
+		}
+	}
+
+	hasLimits := !v.TableRead || v.ProcsRead > 0
+	for _, r := range v.Reasons {
+		if limitReasons[r.Code] {
+			hasLimits = true
+		}
+	}
+	if !hasLimits {
+		return nil
+	}
+	if err := fprintf(w, "\nlimits\n"); err != nil {
+		return err
+	}
+	for _, r := range v.Reasons {
+		if !limitReasons[r.Code] {
+			continue
+		}
+		if err := writeReason(w, r); err != nil {
+			return err
+		}
+	}
+	if v.ProcsRead > 0 {
+		if err := fprintf(w, "  - holder lookup walked %d process(es), %d not readable\n",
+			v.ProcsRead, v.ProcsDenied); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// renderUnixJSON is the machine-readable form.
+//
+// "path" is omitted for an abstract name: there is no path, and a zero-valued
+// object saying exists=false would be a claim about a filesystem lookup that was
+// deliberately not made.
+func renderUnixJSON(w io.Writer, v verdict.UnixVerdict) error {
+	type jsonUnixHolder struct {
+		Inode     uint64      `json:"inode"`
+		Type      string      `json:"type"`
+		State     string      `json:"state"`
+		Listening bool        `json:"listening"`
+		Owners    []jsonOwner `json:"owners"`
+	}
+	type jsonUnixPath struct {
+		Measured bool   `json:"measured"`
+		Exists   bool   `json:"exists"`
+		Kind     string `json:"kind,omitempty"`
+		Error    string `json:"error,omitempty"`
+	}
+	type jsonUnixEvidence struct {
+		TableRead   bool   `json:"table_read"`
+		TableError  string `json:"table_error,omitempty"`
+		ProcsRead   int    `json:"procs_read"`
+		ProcsDenied int    `json:"procs_denied"`
+	}
+	type jsonUnix struct {
+		Target   string           `json:"target"`
+		Abstract bool             `json:"abstract"`
+		Kind     string           `json:"kind"`
+		Holders  []jsonUnixHolder `json:"holders"`
+		Reasons  []jsonReason     `json:"reasons"`
+		Path     *jsonUnixPath    `json:"path,omitempty"`
+		Evidence jsonUnixEvidence `json:"evidence"`
+		Version  string           `json:"version"`
+	}
+
+	rep := jsonUnix{
+		Target:   v.Query.Name,
+		Abstract: v.Query.Abstract,
+		Kind:     string(v.Kind),
+		Holders:  make([]jsonUnixHolder, 0, len(v.Holders)),
+		Reasons:  make([]jsonReason, 0, len(v.Reasons)),
+		Evidence: jsonUnixEvidence{
+			TableRead:   v.TableRead,
+			TableError:  v.TableErr,
+			ProcsRead:   v.ProcsRead,
+			ProcsDenied: v.ProcsDenied,
+		},
+		Version: version.Resolve().Version,
+	}
+	if !v.Query.Abstract {
+		rep.Path = &jsonUnixPath{
+			Measured: v.Path.Measured,
+			Exists:   v.Path.Exists,
+			Kind:     v.Path.Kind,
+			Error:    v.Path.Err,
+		}
+	}
+	for _, h := range v.Holders {
+		rep.Holders = append(rep.Holders, jsonUnixHolder{
+			Inode:     h.Socket.Inode,
+			Type:      h.Socket.Type.String(),
+			State:     h.Socket.State.String(),
+			Listening: h.Socket.Listening(),
+			Owners:    jsonOwners(h.Owners),
+		})
+	}
+	for _, r := range v.Reasons {
+		rep.Reasons = append(rep.Reasons, jsonReason{Code: r.Code, Detail: r.Detail})
+	}
+	return encodeJSON(w, rep)
 }
 
 // renderScope names the network namespace the answer is about.
@@ -1077,8 +1331,18 @@ func usage(w io.Writer) error {
 
 usage
   portwhy why <host:port> [flags]
+  portwhy unix <path|@name> [flags]
   portwhy states
   portwhy version
+
+"unix" asks the other question this tool answers: a unix socket name is not a
+port. Two facts decide it — whether a socket in /proc/net/unix carries the name,
+and what is at the path — and they can disagree in both directions:
+  a socket file with no process behind it still makes bind() fail (remove it);
+  a name removed while its socket stayed open is free for a new bind.
+It has its own flags: -json, -tables DIR, -proc ROOT, -no-holders. An abstract
+name (@name) is never looked up in the filesystem: the two namespaces are
+independent.
 
 flags for "why"
   -proto SPEC      tcp, udp or both (default tcp)
@@ -1115,8 +1379,8 @@ every report states its scope
 
 exit codes
   0  free: nothing readable occupies it
-  1  taken: a listener, a bound udp socket, a TIME_WAIT reservation or another
-     socket holds it, so a bind will fail
+  1  taken: a listener, a bound udp socket, a TIME_WAIT reservation, another
+     socket, or a unix name that cannot be bound holds it
   2  usage or internal error
   3  unknown: the evidence needed was missing — this is not "free"
 
@@ -1126,6 +1390,8 @@ example
   portwhy why :53 -proto both
   portwhy why :8080 -all
   portwhy why :8080 -probe
+  portwhy unix /run/app.sock
+  portwhy unix @my-service -json
   portwhy states
 `, procnet.DefaultDir, sysctl.DefaultDir, sockid.DefaultRoot)
 }
