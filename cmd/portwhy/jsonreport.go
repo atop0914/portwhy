@@ -133,6 +133,20 @@ type reasonJSON struct {
 	Detail string `json:"detail,omitempty"`
 }
 
+// batchError is the object for a line of a batch that never became a question.
+//
+// It carries no evidence, no findings and no reasons: nothing was measured and
+// nothing was judged, and a zero-valued report would say both had happened. That
+// is why it is a different shape rather than a portReport with kind "usage" — and
+// why the rule "usage is the only kind without evidence" is written down.
+type batchError struct {
+	SchemaVersion int    `json:"schema_version"`
+	Target        string `json:"target"`
+	Kind          string `json:"kind"`
+	Error         string `json:"error"`
+	Version       string `json:"version"`
+}
+
 type portEvidence struct {
 	TablesRead       int              `json:"tables_read"`
 	TablesUnreadable []tableHoleJSON  `json:"tables_unreadable"`

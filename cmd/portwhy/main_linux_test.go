@@ -31,8 +31,16 @@ func tablesDir(t *testing.T, files map[string]string) string {
 
 func runCLI(t *testing.T, args ...string) (code int, stdout, stderr string) {
 	t.Helper()
+	return runCLIStdin(t, "", args...)
+}
+
+// runCLIStdin is runCLI with something on standard input, which is what -batch
+// reads. The empty reader is not a nil: a command that reads stdin must get the
+// same "nothing was there" answer a terminal would give it.
+func runCLIStdin(t *testing.T, stdin string, args ...string) (code int, stdout, stderr string) {
+	t.Helper()
 	var out, errb bytes.Buffer
-	code = run(args, &out, &errb)
+	code = run(args, strings.NewReader(stdin), &out, &errb)
 	return code, out.String(), errb.String()
 }
 

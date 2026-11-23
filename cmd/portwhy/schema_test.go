@@ -26,6 +26,7 @@ var docRoots = map[string]reflect.Type{
 	"portReport": reflect.TypeOf(portReport{}),
 	"unixReport": reflect.TypeOf(unixReport{}),
 	"bothReport": reflect.TypeOf(bothReport{}),
+	"batchError": reflect.TypeOf(batchError{}),
 }
 
 // schemaField is one path in one document, with the JSON type a consumer sees.

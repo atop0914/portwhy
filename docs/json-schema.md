@@ -172,6 +172,56 @@ UDP 53 taken while TCP 53 is free is the normal state of a DNS host, and a singl
 | `tcp` | object | always | never absent; a `portReport` |
 | `udp` | object | always | never absent; a `portReport` |
 
+## Batch mode: NDJSON
+
+`portwhy why -batch` reads targets from stdin and writes one compact JSON object
+per line. Three shapes can appear, and they are distinguished by `kind`:
+
+- a line that became a question with one protocol is a `portReport`;
+- a line that became a question with `-proto both` is a `bothReport`;
+- a line that never became a question is a `batchError`, whose `kind` is
+  `usage`.
+
+`usage` is the only kind that carries `error` and no `evidence`. Everything else
+carries evidence, because something was measured. A consumer can therefore
+decide what to do from `kind` alone.
+
+Rules a stream consumer can rely on:
+
+- **One object per line, always.** No pretty-printing, no array wrapper, no
+  trailing commas. `jq -c .` on any single line must succeed.
+- **Output order matches input order**, counting only non-blank inputs. That is
+  how a line is matched back to what was asked; `target` states the question in
+  its normalised form (`:9000` becomes `0.0.0.0:9000`).
+- **Blank lines are not targets** and produce no object. A batch with no
+  non-blank line at all is a usage error (exit 2) with nothing on stdout:
+  "nothing was asked" must never read as "nothing is in the way".
+- **Every line is flushed as it is produced**, so a consumer reading a pipe sees
+  answers as they are made rather than at exit.
+- **The tables are read once**, before the first line. Every answer in one batch
+  describes the same instant, which is a fact a monitor can reason about; a
+  per-line re-read would produce answers about N instants it cannot.
+- **The exit code is the most severe line's**, in this order:
+  `usage (2)` > `unknown (3)` > `taken (1)` > `free (0)`. Usage outranks unknown
+  because it is a statement about the whole run; unknown outranks taken because a
+  monitor with a blind spot is worse off than one that found a busy port.
+- **`-probe` is refused with `-batch`**: each target would be a real `bind()`, and
+  N side effects have to be opted into one target at a time. The refusal is a
+  usage error, not a silently ignored flag.
+- **`unix` has no batch mode.** A unix name is a different question with a
+  different document, and one stream mixing the two shapes would force every
+  consumer to branch on shape before it could read a kind.
+
+### batchError
+
+| field | type | when it appears | absence means |
+|---|---|---|---|
+| `schema_version` | integer | always | never absent |
+| `target` | string | always | never absent; the line exactly as it was read, trimmed |
+| `kind` | string | always | never absent; always `usage` |
+| `error` | string | always | never absent; why the line is not a question |
+| `version` | string | always | never absent; the program, not evidence |
+
 ## The two reports are not one report
 
 `target`, `kind`, `reasons`, `version` and `schema_version` appear in both

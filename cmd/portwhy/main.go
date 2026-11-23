@@ -36,17 +36,20 @@ const (
 )
 
 func main() {
-	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
 }
 
-func run(args []string, stdout, stderr io.Writer) int {
+// run takes stdin because one command reads it: `why -batch` answers the targets
+// it finds there. Handing it in rather than reaching for os.Stdin is what lets
+// the batch tests state their input.
+func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
 		_ = usage(stderr)
 		return exitUsage
 	}
 	switch args[0] {
 	case "why":
-		return runWhy(args[1:], stdout, stderr)
+		return runWhy(args[1:], stdin, stdout, stderr)
 	case "unix":
 		return runUnix(args[1:], stdout, stderr)
 	case "states":
@@ -139,7 +142,7 @@ func runVersion(stdout, stderr io.Writer) int {
 	return exitFree
 }
 
-func runWhy(args []string, stdout, stderr io.Writer) int {
+func runWhy(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("why", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	proto := fs.String("proto", "tcp", "protocol to check: tcp, udp or both")
@@ -150,13 +153,9 @@ func runWhy(args []string, stdout, stderr io.Writer) int {
 	skipHolders := fs.Bool("no-holders", false, "do not walk /proc/<pid>/fd: kernel state only")
 	showAll := fs.Bool("all", false, "also list every row on this port, with why it did or did not take part")
 	useProbe := fs.Bool("probe", false, "attempt a real bind() (plain and SO_REUSEADDR, never listen())")
+	batch := fs.Bool("batch", false, "read targets from stdin, one per line, and write one JSON object per line")
 
 	if err := fs.Parse(splitFlags(fs, args)); err != nil {
-		return exitUsage
-	}
-	if fs.NArg() != 1 {
-		_ = fprintf(stderr, "portwhy: why takes exactly one target, got %d\n\n", fs.NArg())
-		_ = usage(stderr)
 		return exitUsage
 	}
 
@@ -165,6 +164,33 @@ func runWhy(args []string, stdout, stderr io.Writer) int {
 		_ = fprintf(stderr, "portwhy: %v\n", err)
 		return exitUsage
 	}
+
+	if *batch {
+		if fs.NArg() > 0 {
+			_ = fprintf(stderr, "portwhy: -batch reads its targets from stdin, so it takes no target "+
+				"argument (got %q)\n\n", fs.Arg(0))
+			_ = usage(stderr)
+			return exitUsage
+		}
+		// A batch of N probes is N real bind() calls, each with its own chance of
+		// joining a listening group or holding a port. The cost is per target, so
+		// the opt-in has to be per target: the flag that turns it on lives in the
+		// command that has one target.
+		if *useProbe {
+			_ = fprintf(stderr, "portwhy: -probe cannot be combined with -batch: every target would be a "+
+				"real bind(), and N side effects must be opted into one target at a time\n")
+			return exitUsage
+		}
+		tables, env := loadEvidence(*tableDir, *sysctlDir, *procRoot, *skipHolders, stderr)
+		return runBatch(protos, *showAll, tables, env, stdin, stdout, stderr)
+	}
+
+	if fs.NArg() != 1 {
+		_ = fprintf(stderr, "portwhy: why takes exactly one target, got %d\n\n", fs.NArg())
+		_ = usage(stderr)
+		return exitUsage
+	}
+
 	addr, err := parseTarget(fs.Arg(0))
 	if err != nil {
 		_ = fprintf(stderr, "portwhy: %v\n", err)
@@ -188,61 +214,7 @@ func runWhy(args []string, stdout, stderr io.Writer) int {
 		return exitUsage
 	}
 
-	tables := procnet.ReadAll(*tableDir)
-
-	// The one tunable that decides whether a [::] listener also holds IPv4. It
-	// is read unconditionally — one small file — and handed to the judgement as
-	// evidence, so that a failed read is reported as a hole and not replaced by
-	// the value Linux usually has.
-	measuredV6Only := sysctl.ReadBindV6Only(*sysctlDir)
-
-	// The two port-pool tunables. They are read for every question, including
-	// the ones outside the pool: reading them is what lets the report say "your
-	// port is outside the range this host measured" instead of saying nothing,
-	// and a failed read has to be a stated hole rather than a silent silence.
-	measuredRange := sysctl.ReadPortRange(*sysctlDir)
-	measuredReserved := sysctl.ReadReservedPorts(*sysctlDir)
-
-	// The capability boundary: below it a non-root bind is refused with EACCES
-	// before any address is considered, which is neither "taken" nor "free". It
-	// is read from the tunable, never assumed to be 1024 — a host whose boundary
-	// is 0 (every container by default) has no privileged port at all.
-	measuredBoundary := sysctl.ReadPrivilegedPortStart(*sysctlDir)
-
-	// The namespace every row in this report came from. Read from the same
-	// procfs root the holder walk uses, so a test can state a namespace without
-	// being in one.
-	measuredNetNS := netns.Read(*procRoot)
-
-	env := verdict.Env{
-		V6Only:     measuredV6Only,
-		Ephemeral:  measuredRange,
-		Reserved:   measuredReserved,
-		Privileged: measuredBoundary,
-		NetNS:      measuredNetNS,
-	}
-	if !*skipHolders {
-		idx, err := sockid.Scan(*procRoot)
-		if err != nil {
-			// The verdict is still buildable from kernel state; what is lost is
-			// the ability to name the holder. Say so in the report as well as on
-			// stderr: a machine reading -json has no stderr.
-			env.HoldersErr = err.Error()
-			_ = fprintf(stderr, "portwhy: warning: cannot name holders: %v\n", err)
-		} else {
-			env.Lookup = func(s procnet.Socket) []verdict.Owner {
-				holders := idx.Holders(s.Inode)
-				out := make([]verdict.Owner, 0, len(holders))
-				for _, h := range holders {
-					out = append(out, verdict.Owner{PID: h.PID, Comm: h.Comm, FD: h.FD})
-				}
-				return out
-			}
-			env.ProcsRead = idx.ProcsRead
-			env.ProcsDenied = idx.ProcsDenied
-			env.PPID = idx.PPID
-		}
-	}
+	tables, env := loadEvidence(*tableDir, *sysctlDir, *procRoot, *skipHolders, stderr)
 
 	// Tables first, probe second. The order is not an implementation detail: it
 	// is what lets the report say "the tables showed X, and a bind at time T
@@ -291,6 +263,74 @@ func runWhy(args []string, stdout, stderr io.Writer) int {
 	return exitCode(tcp.Kind)
 }
 
+// loadEvidence reads everything a port answer needs from the machine.
+//
+// It is one function because batch mode has to read exactly the same things as
+// single-target mode, once, before the first line: two code paths that gather
+// evidence separately are two code paths that can disagree about what counts as
+// evidence.
+//
+// Nothing here decides anything. A failed read is carried as a failed read, so
+// the judgement can turn it into a hole rather than into a default.
+func loadEvidence(tableDir, sysctlDir, procRoot string, skipHolders bool, stderr io.Writer) ([]procnet.Table, verdict.Env) {
+	tables := procnet.ReadAll(tableDir)
+
+	// The one tunable that decides whether a [::] listener also holds IPv4. It
+	// is read unconditionally — one small file — and handed to the judgement as
+	// evidence, so that a failed read is reported as a hole and not replaced by
+	// the value Linux usually has.
+	measuredV6Only := sysctl.ReadBindV6Only(sysctlDir)
+
+	// The two port-pool tunables. They are read for every question, including
+	// the ones outside the pool: reading them is what lets the report say "your
+	// port is outside the range this host measured" instead of saying nothing,
+	// and a failed read has to be a stated hole rather than a silent silence.
+	measuredRange := sysctl.ReadPortRange(sysctlDir)
+	measuredReserved := sysctl.ReadReservedPorts(sysctlDir)
+
+	// The capability boundary: below it a non-root bind is refused with EACCES
+	// before any address is considered, which is neither "taken" nor "free". It
+	// is read from the tunable, never assumed to be 1024 — a host whose boundary
+	// is 0 (every container by default) has no privileged port at all.
+	measuredBoundary := sysctl.ReadPrivilegedPortStart(sysctlDir)
+
+	// The namespace every row in this report came from. Read from the same
+	// procfs root the holder walk uses, so a test can state a namespace without
+	// being in one.
+	measuredNetNS := netns.Read(procRoot)
+
+	env := verdict.Env{
+		V6Only:     measuredV6Only,
+		Ephemeral:  measuredRange,
+		Reserved:   measuredReserved,
+		Privileged: measuredBoundary,
+		NetNS:      measuredNetNS,
+	}
+	if !skipHolders {
+		idx, err := sockid.Scan(procRoot)
+		if err != nil {
+			// The verdict is still buildable from kernel state; what is lost is
+			// the ability to name the holder. Say so in the report as well as on
+			// stderr: a machine reading -json has no stderr.
+			env.HoldersErr = err.Error()
+			_ = fprintf(stderr, "portwhy: warning: cannot name holders: %v\n", err)
+		} else {
+			env.Lookup = func(s procnet.Socket) []verdict.Owner {
+				holders := idx.Holders(s.Inode)
+				out := make([]verdict.Owner, 0, len(holders))
+				for _, h := range holders {
+					out = append(out, verdict.Owner{PID: h.PID, Comm: h.Comm, FD: h.FD})
+				}
+				return out
+			}
+			env.ProcsRead = idx.ProcsRead
+			env.ProcsDenied = idx.ProcsDenied
+			env.PPID = idx.PPID
+		}
+	}
+	return tables, env
+}
+
 // writeReport renders one verdict in the requested format.
 func writeReport(w io.Writer, v verdict.Verdict, asJSON bool) error {
 	if asJSON {
@@ -311,8 +351,19 @@ func runUnix(args []string, stdout, stderr io.Writer) int {
 	tableDir := fs.String("tables", unixsock.DefaultDir, "directory holding the kernel socket tables")
 	procRoot := fs.String("proc", sockid.DefaultRoot, "procfs root used to name the holder")
 	skipHolders := fs.Bool("no-holders", false, "do not walk /proc/<pid>/fd: kernel state only")
+	batch := fs.Bool("batch", false, "not supported: batch mode answers port targets only")
 
 	if err := fs.Parse(splitFlags(fs, args)); err != nil {
+		return exitUsage
+	}
+	if *batch {
+		// Named rather than left to the flag parser: "-batch" exists on "why", so
+		// a user who typed it here would otherwise get "flag provided but not
+		// defined" and conclude the version is old, not that the two questions
+		// cannot share a stream.
+		_ = fprintf(stderr, "portwhy: -batch answers port targets only. A unix name is a different "+
+			"question with a different document, and one stream that mixed the two would make every "+
+			"consumer branch on shape before it could read a kind\n")
 		return exitUsage
 	}
 	if fs.NArg() != 1 {
@@ -940,6 +991,15 @@ flags for "why"
                    Exit code may become 3 where the tables had said free, because
                    a refused bind disproves that answer
   -no-holders      skip the /proc/<pid>/fd walk
+  -batch           read targets from stdin, one per line, and write one JSON
+                   object per line (NDJSON). Every line is answered from the
+                   tables read before the first line, so the whole batch
+                   describes one instant. A line that is not a target gets an
+                   error object (kind "usage") and the other lines still run.
+                   The exit code is the most severe line's, in this order:
+                   usage > unknown > taken > free. Takes no target argument,
+                   and refuses -probe: a batch of N probes is N real bind()s,
+                   and N side effects have to be opted into one at a time
   -tables DIR      kernel socket table directory (default %s)
   -sysctl DIR      kernel tunable directory (default %s). Four are read:
                    net/ipv6/bindv6only (does a [::] listener also hold IPv4),
@@ -971,6 +1031,7 @@ example
   portwhy why :53 -proto both
   portwhy why :8080 -all
   portwhy why :8080 -probe
+  portwhy why -batch < ports.txt
   portwhy unix /run/app.sock
   portwhy unix @my-service -json
   portwhy states
