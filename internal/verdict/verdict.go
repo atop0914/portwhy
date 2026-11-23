@@ -12,7 +12,6 @@
 package verdict
 
 import (
-	"errors"
 	"fmt"
 	"net/netip"
 	"sort"
@@ -233,6 +232,11 @@ type Env struct {
 	// Lookup returns the holders of one socket. Nil is allowed and means "not
 	// attempted"; findings then carry no owners rather than invented ones.
 	Lookup func(procnet.Socket) []Owner
+	// HoldersErr is set when the walk was attempted and failed. Lookup nil with
+	// an empty HoldersErr means nobody was asked; Lookup nil with it set means
+	// the asking failed. The two must not be spelled the same way: one is a
+	// choice the user made, the other is a blind spot they need to know about.
+	HoldersErr string
 	// ProcsRead and ProcsDenied describe how complete the holder lookup was.
 	ProcsRead   int
 	ProcsDenied int
@@ -274,6 +278,27 @@ type Env struct {
 	NetNS netns.Identity
 }
 
+// TableHole is one table that should have answered and did not.
+//
+// The two facts are kept apart because they describe different worlds: Missing
+// is a fact about the kernel (a build without IPv6 has no tcp6), Err is a fact
+// about this process's access to it. Both are holes in the answer, but only one
+// of them is something the user can fix.
+type TableHole struct {
+	Name    string
+	Missing bool
+	Err     string
+}
+
+// UnreadableNames lists the tables, for prose.
+func UnreadableNames(holes []TableHole) []string {
+	out := make([]string, 0, len(holes))
+	for _, h := range holes {
+		out = append(out, h.Name)
+	}
+	return out
+}
+
 // Verdict is the answer plus the evidence it rests on.
 type Verdict struct {
 	Query    Query
@@ -287,7 +312,12 @@ type Verdict struct {
 	// TablesRead and TablesUnreadable document the scope of the look, so a
 	// reader can tell "nothing holds it" from "nothing was readable".
 	TablesRead       int
-	TablesUnreadable []string
+	TablesUnreadable []TableHole
+	// HoldersAttempted and HoldersErr describe the /proc walk itself, not its
+	// result. A report that only carried a count would have to spell "skipped"
+	// and "walked, found none" the same way.
+	HoldersAttempted bool
+	HoldersErr       string
 	ProcsRead        int
 	ProcsDenied      int
 	// Probe is the empirical evidence the answer was allowed to use, in the
@@ -321,14 +351,16 @@ type Verdict struct {
 // settled first, so that no later branch can turn a blind spot into "free".
 func Explain(q Query, tables []procnet.Table, env Env) Verdict {
 	v := Verdict{
-		Query:       q,
-		ProcsRead:   env.ProcsRead,
-		ProcsDenied: env.ProcsDenied,
-		V6Only:      env.V6Only,
-		Ephemeral:   env.Ephemeral,
-		Reserved:    env.Reserved,
-		Privileged:  env.Privileged,
-		NetNS:       env.NetNS,
+		Query:            q,
+		HoldersAttempted: env.Lookup != nil || env.HoldersErr != "",
+		HoldersErr:       env.HoldersErr,
+		ProcsRead:        env.ProcsRead,
+		ProcsDenied:      env.ProcsDenied,
+		V6Only:           env.V6Only,
+		Ephemeral:        env.Ephemeral,
+		Reserved:         env.Reserved,
+		Privileged:       env.Privileged,
+		NetNS:            env.NetNS,
 	}
 
 	var relevant []procnet.Table
@@ -346,12 +378,16 @@ func Explain(q Query, tables []procnet.Table, env Env) Verdict {
 		switch {
 		case t.Err == nil:
 			readable++
-		case isMissingTable(t.Err) && q.Addr.IP.Is4() && t.Family == procnet.V6:
+		case t.Missing() && q.Addr.IP.Is4() && t.Family == procnet.V6:
 			// Nothing to hide an IPv4 answer behind.
-		case isMissingTable(t.Err) && q.Addr.IP.Is6() && t.Family == procnet.V4:
+		case t.Missing() && q.Addr.IP.Is6() && t.Family == procnet.V4:
 			// Same, mirrored.
 		default:
-			v.TablesUnreadable = append(v.TablesUnreadable, t.Name)
+			v.TablesUnreadable = append(v.TablesUnreadable, TableHole{
+				Name:    t.Name,
+				Missing: t.Missing(),
+				Err:     errText(t.Err),
+			})
 		}
 	}
 	v.TablesRead = readable
@@ -360,7 +396,7 @@ func Explain(q Query, tables []procnet.Table, env Env) Verdict {
 		v.Kind = KindUnknown
 		v.Reasons = append(v.Reasons, Reason{
 			Code:   ReasonTableUnreadable,
-			Detail: fmt.Sprintf("could not read: %v", v.TablesUnreadable),
+			Detail: fmt.Sprintf("could not read: %v", UnreadableNames(v.TablesUnreadable)),
 		})
 		// The probe cannot repair a table that was never read: it can only say
 		// what one instant looked like. It is still recorded, because a bind
@@ -1125,8 +1161,11 @@ func v6WildcardShadow(q Query, tables []procnet.Table) *procnet.Socket {
 	return nil
 }
 
-// isMissingTable separates "the kernel has no such table" from "we could not
-// read it". Only the second one is a hole in the evidence.
-func isMissingTable(err error) bool {
-	return errors.Is(err, procnet.ErrTableMissing)
+// errText keeps a table's failure message for the report without letting a nil
+// error turn into the string "<nil>".
+func errText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }

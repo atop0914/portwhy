@@ -134,6 +134,12 @@ type Table struct {
 	Err     error
 }
 
+// Missing reports whether the kernel does not offer this table at all, as
+// opposed to the table existing and this process failing to read it. The
+// distinction is reported to the user because only one of the two is something
+// they can do anything about.
+func (t Table) Missing() bool { return errors.Is(t.Err, ErrTableMissing) }
+
 // ErrNoHeader is returned for a table whose first line is not the column
 // header. Every kernel socket table starts with one; its absence means we are
 // reading something else (a truncated capture, an empty file, a different

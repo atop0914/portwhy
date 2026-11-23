@@ -102,8 +102,17 @@ func TestWhyJSONIsAStableContract(t *testing.T) {
 		Kind     string `json:"kind"`
 		Findings []any  `json:"findings"`
 		Evidence struct {
-			TablesRead       int      `json:"tables_read"`
-			TablesUnreadable []string `json:"tables_unreadable"`
+			TablesRead       int `json:"tables_read"`
+			TablesUnreadable []struct {
+				Name    string `json:"name"`
+				Present bool   `json:"present"`
+				Error   string `json:"error"`
+			} `json:"tables_unreadable"`
+			Holders struct {
+				Attempted bool `json:"attempted"`
+				ProcsRead *int `json:"procs_read"`
+				Denied    *int `json:"procs_denied"`
+			} `json:"holder_lookup"`
 		} `json:"evidence"`
 	}
 	if err := json.Unmarshal([]byte(out), &rep); err != nil {
@@ -123,6 +132,55 @@ func TestWhyJSONIsAStableContract(t *testing.T) {
 	}
 	if rep.Evidence.TablesUnreadable == nil {
 		t.Error("tables_unreadable is null; an empty list is the contract")
+	}
+	// This run used -no-holders, so the walk did not happen. A report that said
+	// procs_read: 0 would be claiming to have walked and found nothing.
+	if rep.Evidence.Holders.Attempted {
+		t.Error("holder_lookup.attempted is true with -no-holders")
+	}
+	if rep.Evidence.Holders.ProcsRead != nil || rep.Evidence.Holders.Denied != nil {
+		t.Error("holder_lookup carries counts for a walk that never ran")
+	}
+}
+
+// The other half of the same rule: when the walk does run, the counts are there.
+// Without this, a report could satisfy the test above by never reporting counts.
+func TestWhyJSONHolderLookupCarriesCountsWhenWalked(t *testing.T) {
+	dir := tablesDir(t, map[string]string{"tcp": headerTCP + "\n"})
+	code, out, errb := runCLI(t, "why", ":9000", "-json", "-tables", dir)
+	if code != exitFree {
+		t.Fatalf("exit = %d, want %d (stderr: %s)", code, exitFree, errb)
+	}
+	var rep struct {
+		Evidence struct {
+			Holders struct {
+				Attempted bool `json:"attempted"`
+				ProcsRead *int `json:"procs_read"`
+				Denied    *int `json:"procs_denied"`
+			} `json:"holder_lookup"`
+		} `json:"evidence"`
+	}
+	if err := json.Unmarshal([]byte(out), &rep); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, out)
+	}
+	if !rep.Evidence.Holders.Attempted {
+		t.Fatal("holder_lookup.attempted is false without -no-holders")
+	}
+	if rep.Evidence.Holders.ProcsRead == nil || rep.Evidence.Holders.Denied == nil {
+		t.Fatal("holder_lookup is missing its counts for a walk that ran")
+	}
+	if *rep.Evidence.Holders.ProcsRead < 1 {
+		t.Errorf("procs_read = %d, want at least this process", *rep.Evidence.Holders.ProcsRead)
+	}
+}
+
+// A required field is not optional: dropping procs_read must be visible, which
+// is what makes the null above meaningful rather than merely absent.
+func TestWhyJSONSkippedWalkHasNullCountsNotZero(t *testing.T) {
+	dir := tablesDir(t, map[string]string{"tcp": headerTCP + "\n"})
+	_, out, _ := runCLI(t, "why", ":9000", "-json", "-tables", dir, "-no-holders")
+	if strings.Contains(out, `"procs_read": 0`) {
+		t.Errorf("skipped walk reported procs_read: 0 instead of null:\n%s", out)
 	}
 }
 

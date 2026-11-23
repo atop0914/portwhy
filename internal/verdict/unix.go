@@ -81,6 +81,9 @@ type UnixEnv struct {
 	// Lookup returns the holders of one inode. Nil means the walk was not
 	// attempted, which is disclosed rather than read as "no owner".
 	Lookup func(inode uint64) []Owner
+	// HoldersErr is set when the walk was attempted and failed, which is a
+	// blind spot rather than a choice; the two are never spelled the same way.
+	HoldersErr string
 	// ProcsRead and ProcsDenied describe how complete the holder lookup was.
 	ProcsRead   int
 	ProcsDenied int
@@ -100,10 +103,16 @@ type UnixVerdict struct {
 	// is gone" has to be able to show what it looked at.
 	Path unixsock.PathState
 	// TableRead is false when the kernel table could not be read; Err says why.
-	TableRead   bool
-	TableErr    string
-	ProcsRead   int
-	ProcsDenied int
+	// TableMissing narrows that: the kernel does not offer /proc/net/unix at
+	// all, which is a fact about the kernel rather than about our access.
+	TableRead    bool
+	TableMissing bool
+	TableErr     string
+	// HoldersAttempted and HoldersErr describe the /proc walk itself.
+	HoldersAttempted bool
+	HoldersErr       string
+	ProcsRead        int
+	ProcsDenied      int
 }
 
 // ExplainUnix classifies one unix socket name.
@@ -115,11 +124,14 @@ type UnixVerdict struct {
 // different statements, and only the second one is a free name.
 func ExplainUnix(q UnixQuery, table unixsock.Table, env UnixEnv) UnixVerdict {
 	v := UnixVerdict{
-		Query:       q,
-		Path:        env.Path,
-		TableRead:   table.Err == nil,
-		ProcsRead:   env.ProcsRead,
-		ProcsDenied: env.ProcsDenied,
+		Query:            q,
+		Path:             env.Path,
+		TableRead:        table.Err == nil,
+		TableMissing:     table.Missing(),
+		HoldersAttempted: env.Lookup != nil || env.HoldersErr != "",
+		HoldersErr:       env.HoldersErr,
+		ProcsRead:        env.ProcsRead,
+		ProcsDenied:      env.ProcsDenied,
 	}
 
 	if table.Err != nil {

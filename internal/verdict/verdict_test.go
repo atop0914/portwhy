@@ -201,8 +201,28 @@ func TestExplainUnreadableTableIsUnknownNotFree(t *testing.T) {
 	if !hasReason(v, ReasonTableUnreadable) {
 		t.Error("missing table-unreadable reason")
 	}
-	if len(v.TablesUnreadable) != 1 || v.TablesUnreadable[0] != "tcp" {
-		t.Errorf("TablesUnreadable = %v, want [tcp]", v.TablesUnreadable)
+	if len(v.TablesUnreadable) != 1 {
+		t.Fatalf("TablesUnreadable = %v, want one hole", v.TablesUnreadable)
+	}
+	hole := v.TablesUnreadable[0]
+	if hole.Name != "tcp" || hole.Missing || hole.Err == "" {
+		t.Errorf("hole = %+v, want a present-but-unreadable tcp with its error kept", hole)
+	}
+}
+
+// A table the kernel does not offer is a hole of a different kind: it says
+// something about the kernel, not about our access. The JSON layer reports the
+// distinction, so the judgement has to record it.
+func TestExplainMissingTableRecordsThatItIsMissing(t *testing.T) {
+	tables := []procnet.Table{
+		{Name: "tcp", Proto: procnet.TCP, Family: procnet.V4, Err: procnet.ErrTableMissing},
+	}
+	v := Explain(query("127.0.0.1", 8080, procnet.TCP), tables, Env{})
+	if v.Kind != KindUnknown {
+		t.Fatalf("kind = %v, want unknown", v.Kind)
+	}
+	if len(v.TablesUnreadable) != 1 || !v.TablesUnreadable[0].Missing {
+		t.Fatalf("TablesUnreadable = %+v, want one hole marked missing", v.TablesUnreadable)
 	}
 }
 

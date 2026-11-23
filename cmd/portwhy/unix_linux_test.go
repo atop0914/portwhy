@@ -187,7 +187,10 @@ func TestUnixJSON(t *testing.T) {
 			Kind     string `json:"kind"`
 		} `json:"path"`
 		Evidence struct {
-			TableRead bool `json:"table_read"`
+			Table struct {
+				Read    bool `json:"read"`
+				Present bool `json:"present"`
+			} `json:"table"`
 		} `json:"evidence"`
 	}
 	if err := json.Unmarshal([]byte(out), &rep); err != nil {
@@ -199,8 +202,8 @@ func TestUnixJSON(t *testing.T) {
 	if rep.Path == nil || !rep.Path.Measured || !rep.Path.Exists || rep.Path.Kind != "socket" {
 		t.Errorf("path = %+v, want measured socket", rep.Path)
 	}
-	if !rep.Evidence.TableRead {
-		t.Error("evidence.table_read is false for a table that was read")
+	if !rep.Evidence.Table.Read || !rep.Evidence.Table.Present {
+		t.Errorf("evidence.table = %+v, want read and present", rep.Evidence.Table)
 	}
 	if len(rep.Holders) != 1 || !rep.Holders[0].Listening || rep.Holders[0].Inode == 0 {
 		t.Errorf("holders = %+v", rep.Holders)

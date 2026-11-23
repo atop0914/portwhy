@@ -134,10 +134,9 @@ type reasonJSON struct {
 }
 
 type portEvidence struct {
-	TablesRead       int      `json:"tables_read"`
-	TablesUnreadable []string `json:"tables_unreadable"`
-	ProcsRead        int      `json:"procs_read"`
-	ProcsDenied      int      `json:"procs_denied"`
+	TablesRead       int              `json:"tables_read"`
+	TablesUnreadable []tableHoleJSON  `json:"tables_unreadable"`
+	Holders          holderLookupJSON `json:"holder_lookup"`
 	// BindV6Only is the tunable an IPv6 wildcard answer depends on. It is always
 	// present, including when it could not be read: a consumer that only sees a
 	// value would never learn that the value was missing.
@@ -152,6 +151,31 @@ type portEvidence struct {
 	// UnprivilegedPortStart is the capability boundary. Always present, and
 	// measured=false with no value is the only honest form of "not read".
 	UnprivilegedPortStart privStartJSON `json:"unprivileged_port_start"`
+}
+
+// tableHoleJSON is one table that should have answered and did not.
+//
+// Present is what keeps "this kernel has no tcp6" from reading as "I was not
+// allowed to read tcp6". Both are holes, and only the second one is something
+// the user can act on, so the document has to say which one it is.
+type tableHoleJSON struct {
+	Name    string `json:"name"`
+	Present bool   `json:"present"`
+	Error   string `json:"error,omitempty"`
+}
+
+// holderLookupJSON says whether /proc was walked at all.
+//
+// A bare procs_read: 0 cannot tell "the walk was skipped" from "the walk read no
+// process", and that is the same mistake as reporting a failed measurement as
+// zero everywhere else in this document. Attempted is the switch; the counts are
+// absent (null) until a walk actually happened, and stay absent when the walk
+// failed, because a count from a failed walk is not a count.
+type holderLookupJSON struct {
+	Attempted   bool   `json:"attempted"`
+	ProcsRead   *int   `json:"procs_read"`
+	ProcsDenied *int   `json:"procs_denied"`
+	Error       string `json:"error,omitempty"`
 }
 
 // netnsJSON keeps the two halves of the reading apart: Error is "this process's
@@ -251,11 +275,33 @@ type unixPathJSON struct {
 	Error    string `json:"error,omitempty"`
 }
 
+// tableJSON is the unix table's own evidence.
+//
+// Read and Present are two switches rather than one because they answer two
+// questions: "did I get the rows" and "does this kernel have the table". A
+// document with only Read=false cannot tell a kernel without /proc/net/unix
+// from a procfs this process may not open.
+type tableJSON struct {
+	Read    bool   `json:"read"`
+	Present bool   `json:"present"`
+	Error   string `json:"error,omitempty"`
+}
+
 type unixEvidenceJSON struct {
-	TableRead   bool   `json:"table_read"`
-	TableError  string `json:"table_error,omitempty"`
-	ProcsRead   int    `json:"procs_read"`
-	ProcsDenied int    `json:"procs_denied"`
+	Table   tableJSON        `json:"table"`
+	Holders holderLookupJSON `json:"holder_lookup"`
+}
+
+// holderLookupJSONOf builds the walk's evidence from a verdict. A walk that
+// failed reports no counts: the numbers exist, but they describe a walk that did
+// not finish, and printing them would invite a consumer to divide by them.
+func holderLookupJSONOf(attempted bool, read, denied int, errMsg string) holderLookupJSON {
+	out := holderLookupJSON{Attempted: attempted, Error: errMsg}
+	if attempted && errMsg == "" {
+		r, d := read, denied
+		out.ProcsRead, out.ProcsDenied = &r, &d
+	}
+	return out
 }
 
 func ownersJSON(owners []verdict.Owner) []ownerJSON {
@@ -329,6 +375,17 @@ func reservedPortsJSONOf(r sysctl.ReservedPorts) reservedPortsJSON {
 	return out
 }
 
+// tableHolesJSON never returns nil: an empty list is the contract, and a null
+// would make "all four tables were read" indistinguishable from "the field was
+// not written".
+func tableHolesJSON(holes []verdict.TableHole) []tableHoleJSON {
+	out := make([]tableHoleJSON, 0, len(holes))
+	for _, h := range holes {
+		out = append(out, tableHoleJSON{Name: h.Name, Present: !h.Missing, Error: h.Err})
+	}
+	return out
+}
+
 func bindV6OnlyJSONOf(b sysctl.BindV6Only) bindV6OnlyJSON {
 	out := bindV6OnlyJSON{Path: b.Path, Error: b.Err}
 	if v, ok := b.Value(); ok {
@@ -352,9 +409,8 @@ func buildPortReport(v verdict.Verdict) portReport {
 		Reasons:       make([]reasonJSON, 0, len(v.Reasons)),
 		Evidence: portEvidence{
 			TablesRead:            v.TablesRead,
-			TablesUnreadable:      v.TablesUnreadable,
-			ProcsRead:             v.ProcsRead,
-			ProcsDenied:           v.ProcsDenied,
+			TablesUnreadable:      tableHolesJSON(v.TablesUnreadable),
+			Holders:               holderLookupJSONOf(v.HoldersAttempted, v.ProcsRead, v.ProcsDenied, v.HoldersErr),
 			BindV6Only:            bindV6OnlyJSONOf(v.V6Only),
 			EphemeralRange:        portRangeJSONOf(v.Ephemeral),
 			ReservedPorts:         reservedPortsJSONOf(v.Reserved),
@@ -362,9 +418,6 @@ func buildPortReport(v verdict.Verdict) portReport {
 			UnprivilegedPortStart: privStartJSONOf(v.Privileged),
 		},
 		Version: version.Resolve().Version,
-	}
-	if rep.Evidence.TablesUnreadable == nil {
-		rep.Evidence.TablesUnreadable = []string{}
 	}
 	for _, f := range v.Findings {
 		jf := portFinding{
@@ -433,10 +486,12 @@ func buildUnixReport(v verdict.UnixVerdict) unixReport {
 		Holders:       make([]unixHolderJSON, 0, len(v.Holders)),
 		Reasons:       make([]reasonJSON, 0, len(v.Reasons)),
 		Evidence: unixEvidenceJSON{
-			TableRead:   v.TableRead,
-			TableError:  v.TableErr,
-			ProcsRead:   v.ProcsRead,
-			ProcsDenied: v.ProcsDenied,
+			Table: tableJSON{
+				Read:    v.TableRead,
+				Present: !v.TableMissing,
+				Error:   v.TableErr,
+			},
+			Holders: holderLookupJSONOf(v.HoldersAttempted, v.ProcsRead, v.ProcsDenied, v.HoldersErr),
 		},
 		Version: version.Resolve().Version,
 	}

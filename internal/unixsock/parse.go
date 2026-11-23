@@ -128,6 +128,12 @@ type Table struct {
 // Bound reports whether the table was read successfully.
 func (t Table) Bound() bool { return t.Err == nil }
 
+// Missing reports whether the kernel does not offer the table at all, as
+// opposed to the table existing and this process failing to read it. A kernel
+// built without unix sockets and a procfs this process may not open both leave
+// the question unanswered, but they are not the same fact.
+func (t Table) Missing() bool { return errors.Is(t.Err, ErrTableMissing) }
+
 // Parse reads /proc/net/unix.
 //
 // An unparsable line is an error, never a skipped line: a parser that drops what

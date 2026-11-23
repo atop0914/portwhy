@@ -225,7 +225,9 @@ func runWhy(args []string, stdout, stderr io.Writer) int {
 		idx, err := sockid.Scan(*procRoot)
 		if err != nil {
 			// The verdict is still buildable from kernel state; what is lost is
-			// the ability to name the holder. Say so, and keep going.
+			// the ability to name the holder. Say so in the report as well as on
+			// stderr: a machine reading -json has no stderr.
+			env.HoldersErr = err.Error()
 			_ = fprintf(stderr, "portwhy: warning: cannot name holders: %v\n", err)
 		} else {
 			env.Lookup = func(s procnet.Socket) []verdict.Owner {
@@ -338,6 +340,7 @@ func runUnix(args []string, stdout, stderr io.Writer) int {
 	if !*skipHolders {
 		idx, err := sockid.Scan(*procRoot)
 		if err != nil {
+			env.HoldersErr = err.Error()
 			_ = fprintf(stderr, "portwhy: warning: cannot name holders: %v\n", err)
 		} else {
 			env.Lookup = func(inode uint64) []verdict.Owner {
@@ -600,7 +603,7 @@ func renderText(w io.Writer, v verdict.Verdict) error {
 
 	// An empty "limits" heading is worse than none: it reads as "there are none"
 	// and as "the section failed to print" at the same time.
-	hasLimits := len(v.TablesUnreadable) > 0 || v.ProcsRead > 0
+	hasLimits := len(v.TablesUnreadable) > 0 || v.ProcsRead > 0 || v.HoldersErr != ""
 	for _, r := range v.Reasons {
 		if limitReasons[r.Code] {
 			hasLimits = true
@@ -622,12 +625,18 @@ func renderText(w io.Writer, v verdict.Verdict) error {
 		}
 	}
 	if len(v.TablesUnreadable) > 0 {
-		if err := fprintf(w, "  - unreadable tables: %s\n", strings.Join(v.TablesUnreadable, ", ")); err != nil {
+		names := strings.Join(verdict.UnreadableNames(v.TablesUnreadable), ", ")
+		if err := fprintf(w, "  - unreadable tables: %s\n", names); err != nil {
 			return err
 		}
 	}
 	if v.ProcsRead > 0 {
 		if err := fprintf(w, "  - holder lookup walked %d process(es), %d not readable\n", v.ProcsRead, v.ProcsDenied); err != nil {
+			return err
+		}
+	}
+	if v.HoldersErr != "" {
+		if err := fprintf(w, "  - holder lookup did not run: %s\n", v.HoldersErr); err != nil {
 			return err
 		}
 	}
@@ -722,7 +731,7 @@ func renderUnixText(w io.Writer, v verdict.UnixVerdict) error {
 		}
 	}
 
-	hasLimits := !v.TableRead || v.ProcsRead > 0
+	hasLimits := !v.TableRead || v.ProcsRead > 0 || v.HoldersErr != ""
 	for _, r := range v.Reasons {
 		if limitReasons[r.Code] {
 			hasLimits = true
@@ -745,6 +754,11 @@ func renderUnixText(w io.Writer, v verdict.UnixVerdict) error {
 	if v.ProcsRead > 0 {
 		if err := fprintf(w, "  - holder lookup walked %d process(es), %d not readable\n",
 			v.ProcsRead, v.ProcsDenied); err != nil {
+			return err
+		}
+	}
+	if v.HoldersErr != "" {
+		if err := fprintf(w, "  - holder lookup did not run: %s\n", v.HoldersErr); err != nil {
 			return err
 		}
 	}
