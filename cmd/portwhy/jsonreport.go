@@ -1,0 +1,496 @@
+package main
+
+// The JSON output is a contract, so the shapes live here rather than inside the
+// render functions that fill them. A type defined at package level can be walked
+// by a test — which is what docs/json-schema.md is checked against — and a
+// reviewer can see the whole file format in one screen.
+//
+// Three rules decide every field below, and they are the same three the text
+// output follows:
+//
+//  1. A field that was not measured is absent or null, never a zero value. A
+//     consumer that reads procs_read: 0 has to be able to tell "the walk was
+//     skipped" from "the walk read no process"; a consumer cannot if both spell
+//     the same bytes.
+//  2. A field that never changes the judgement (the pool range, the capability
+//     boundary, the namespace) is evidence, not a kind. Nothing here turns a
+//     limit into an answer.
+//  3. Same name means same meaning in both reports. The port report and the
+//     unix report are different documents about different questions, so their
+//     field sets differ; where a name repeats (kind, reasons, target, version,
+//     schema_version) it repeats with the same type and the same rule.
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"strings"
+	"time"
+
+	"github.com/atop0914/portwhy/internal/netns"
+	"github.com/atop0914/portwhy/internal/sysctl"
+	"github.com/atop0914/portwhy/internal/verdict"
+	"github.com/atop0914/portwhy/internal/version"
+)
+
+// schemaVersion is the version of the document contract, not of the program.
+//
+// It is an integer on purpose: a consumer has to be able to say "I understand
+// schema 1" and refuse anything else, and that decision cannot be made from a
+// program version string. The rules for changing it are in docs/json-schema.md;
+// the short form is that adding an optional field does not bump it, and changing
+// the meaning or the type of a field does.
+const schemaVersion = 1
+
+// portReport is the answer to one port question.
+type portReport struct {
+	SchemaVersion int           `json:"schema_version"`
+	Target        string        `json:"target"`
+	Proto         string        `json:"proto"`
+	Kind          string        `json:"kind"`
+	Findings      []portFinding `json:"findings"`
+	Reasons       []reasonJSON  `json:"reasons"`
+	Evidence      portEvidence  `json:"evidence"`
+	// Version is the program that produced this document. It is not evidence:
+	// it says nothing about the port, and putting it inside evidence would
+	// invite a consumer to treat it as a measurement.
+	Version string `json:"version"`
+	// Rows is present only with --all, and present even when it is empty: a
+	// consumer must be able to tell "asked, found none" from "did not ask".
+	Rows *[]portRow `json:"rows,omitempty"`
+	// Probe is present only with --probe, for the same reason: absence means the
+	// experiment was not run, and no zero value stands in for it.
+	Probe *portProbe `json:"probe,omitempty"`
+}
+
+// bothReport answers -proto both without merging the two answers.
+//
+// A consumer that received one object with "kind: bound" and both protocols'
+// findings would have no way to tell which row belonged to which question. The
+// wrapper names the exit-code rule in the payload, so a script that only reads
+// JSON is told the same thing the text reader is.
+type bothReport struct {
+	SchemaVersion int        `json:"schema_version"`
+	Target        string     `json:"target"`
+	Both          bool       `json:"both"`
+	ExitFrom      string     `json:"exit_from"`
+	TCP           portReport `json:"tcp"`
+	UDP           portReport `json:"udp"`
+}
+
+// portProbe carries the attempts and the sentence that keeps them from being
+// mistaken for a promise. There is no field for a guarantee, deliberately.
+type portProbe struct {
+	Attempts []probeAttemptJSON `json:"attempts"`
+	Note     string             `json:"note"`
+}
+
+type probeAttemptJSON struct {
+	Mode    string `json:"mode"`
+	At      string `json:"at"`
+	Outcome string `json:"outcome"`
+	Errno   string `json:"errno,omitempty"`
+	Message string `json:"message,omitempty"`
+	// Error is set when the attempt itself is not trustworthy (socket() refused,
+	// close() failed); a consumer that ignores it would read a broken attempt as
+	// a result.
+	Error            string `json:"error,omitempty"`
+	UsableAsEvidence bool   `json:"usable_as_evidence"`
+}
+
+type portFinding struct {
+	State  string      `json:"state"`
+	Effect string      `json:"effect"`
+	Local  string      `json:"local"`
+	Remote string      `json:"remote,omitempty"`
+	Inode  uint64      `json:"inode"`
+	Table  string      `json:"table"`
+	Owners []ownerJSON `json:"owners"`
+}
+
+// portRow is one line of the --all listing: the row, and why it did or did not
+// take part.
+type portRow struct {
+	Match  string      `json:"match"`
+	State  string      `json:"state"`
+	Effect string      `json:"effect"`
+	Local  string      `json:"local"`
+	Remote string      `json:"remote,omitempty"`
+	Inode  uint64      `json:"inode"`
+	Table  string      `json:"table"`
+	Owners []ownerJSON `json:"owners"`
+}
+
+type ownerJSON struct {
+	PID  int    `json:"pid"`
+	Comm string `json:"comm,omitempty"`
+	FD   int    `json:"fd"`
+	Role string `json:"role,omitempty"`
+}
+
+type reasonJSON struct {
+	Code   string `json:"code"`
+	Detail string `json:"detail,omitempty"`
+}
+
+type portEvidence struct {
+	TablesRead       int      `json:"tables_read"`
+	TablesUnreadable []string `json:"tables_unreadable"`
+	ProcsRead        int      `json:"procs_read"`
+	ProcsDenied      int      `json:"procs_denied"`
+	// BindV6Only is the tunable an IPv6 wildcard answer depends on. It is always
+	// present, including when it could not be read: a consumer that only sees a
+	// value would never learn that the value was missing.
+	BindV6Only bindV6OnlyJSON `json:"bindv6only"`
+	// EphemeralRange and ReservedPorts are the port-pool evidence. They are
+	// always present for the same reason: "not read" has to be visible as such.
+	EphemeralRange portRangeJSON     `json:"ephemeral_range"`
+	ReservedPorts  reservedPortsJSON `json:"reserved_ports"`
+	// NetNS is the namespace this report is about. A consumer that files the
+	// answer somewhere durable needs to know which namespace it describes.
+	NetNS netnsJSON `json:"netns"`
+	// UnprivilegedPortStart is the capability boundary. Always present, and
+	// measured=false with no value is the only honest form of "not read".
+	UnprivilegedPortStart privStartJSON `json:"unprivileged_port_start"`
+}
+
+// netnsJSON keeps the two halves of the reading apart: Error is "this process's
+// namespace was not read", ComparisonError is "pid 1's was not, so nothing was
+// compared". SameAsPIDOne is a pointer so that "no comparison" is null rather
+// than false — false would claim a difference nobody measured.
+type netnsJSON struct {
+	Inode           uint64 `json:"inode,omitempty"`
+	Self            string `json:"self,omitempty"`
+	PIDOne          string `json:"pid_one,omitempty"`
+	SameAsPIDOne    *bool  `json:"same_as_pid_one"`
+	Path            string `json:"path"`
+	Error           string `json:"error,omitempty"`
+	ComparisonError string `json:"comparison_error,omitempty"`
+}
+
+// privStartJSON follows the same shape as the other tunables: Measured says a
+// number was read (so Value is authoritative), Present says the file exists at
+// all. Measured=false + Present=true is a file that could not be understood;
+// Measured=false + Present=false is a kernel that does not offer the tunable.
+// Neither of them is 1024.
+type privStartJSON struct {
+	Measured bool   `json:"measured"`
+	Present  bool   `json:"present"`
+	Value    *int   `json:"value,omitempty"`
+	Raw      string `json:"raw,omitempty"`
+	Path     string `json:"path"`
+	Error    string `json:"error,omitempty"`
+}
+
+// portRangeJSON has no zero value that reads as a measurement. Measured is the
+// switch and Low/High are pointers, so a failed read can never be decoded as the
+// interval 0-0 — which would claim every port on the host is outside the pool.
+type portRangeJSON struct {
+	Measured bool   `json:"measured"`
+	Low      *int   `json:"low,omitempty"`
+	High     *int   `json:"high,omitempty"`
+	Raw      string `json:"raw,omitempty"`
+	Path     string `json:"path"`
+	Error    string `json:"error,omitempty"`
+}
+
+// reservedPortsJSON keeps the three states apart with two switches rather than
+// one: Measured says the file was read (so Ports is authoritative, [] meaning
+// "none reserved"), Present says the tunable exists at all. Measured=false with
+// Present=false is a kernel without the tunable; Measured=false with
+// Present=true is a file that could not be understood.
+type reservedPortsJSON struct {
+	Measured bool     `json:"measured"`
+	Present  bool     `json:"present"`
+	Ports    []string `json:"ports"`
+	Raw      string   `json:"raw,omitempty"`
+	Path     string   `json:"path"`
+	Error    string   `json:"error,omitempty"`
+}
+
+// bindV6OnlyJSON has no zero value that reads as a measurement. Measured is the
+// switch, and Value is a pointer so that a failed read cannot be decoded as 0 —
+// the one mistake that would turn "I could not look" into "dual-stack".
+type bindV6OnlyJSON struct {
+	Measured bool   `json:"measured"`
+	Value    *int   `json:"value,omitempty"`
+	Raw      string `json:"raw,omitempty"`
+	Path     string `json:"path"`
+	Error    string `json:"error,omitempty"`
+}
+
+// unixReport is the answer to one unix socket name question.
+//
+// "path" is omitted for an abstract name: there is no path, and a zero-valued
+// object saying exists=false would be a claim about a filesystem lookup that was
+// deliberately not made.
+type unixReport struct {
+	SchemaVersion int              `json:"schema_version"`
+	Target        string           `json:"target"`
+	Abstract      bool             `json:"abstract"`
+	Kind          string           `json:"kind"`
+	Holders       []unixHolderJSON `json:"holders"`
+	Reasons       []reasonJSON     `json:"reasons"`
+	Path          *unixPathJSON    `json:"path,omitempty"`
+	Evidence      unixEvidenceJSON `json:"evidence"`
+	Version       string           `json:"version"`
+}
+
+type unixHolderJSON struct {
+	Inode     uint64      `json:"inode"`
+	Type      string      `json:"type"`
+	State     string      `json:"state"`
+	Listening bool        `json:"listening"`
+	Owners    []ownerJSON `json:"owners"`
+}
+
+type unixPathJSON struct {
+	Measured bool   `json:"measured"`
+	Exists   bool   `json:"exists"`
+	Kind     string `json:"kind,omitempty"`
+	Error    string `json:"error,omitempty"`
+}
+
+type unixEvidenceJSON struct {
+	TableRead   bool   `json:"table_read"`
+	TableError  string `json:"table_error,omitempty"`
+	ProcsRead   int    `json:"procs_read"`
+	ProcsDenied int    `json:"procs_denied"`
+}
+
+func ownersJSON(owners []verdict.Owner) []ownerJSON {
+	out := make([]ownerJSON, 0, len(owners))
+	for _, o := range owners {
+		out = append(out, ownerJSON{PID: o.PID, Comm: o.Comm, FD: o.FD, Role: o.Role.String()})
+	}
+	return out
+}
+
+func netnsJSONOf(n netns.Identity) netnsJSON {
+	out := netnsJSON{
+		Inode:           n.Inode,
+		Self:            n.Self,
+		PIDOne:          n.PIDOne,
+		Path:            n.Path,
+		Error:           n.Err,
+		ComparisonError: n.SameErr,
+	}
+	switch n.Same {
+	case netns.PIDOneSame:
+		same := true
+		out.SameAsPIDOne = &same
+	case netns.PIDOneDifferent:
+		same := false
+		out.SameAsPIDOne = &same
+	}
+	return out
+}
+
+func privStartJSONOf(p sysctl.PrivilegedPortStart) privStartJSON {
+	out := privStartJSON{
+		Measured: p.Known(),
+		Present:  !p.Absent(),
+		Path:     p.Path,
+		Error:    p.Err,
+	}
+	if p.Known() {
+		value := int(p.Port)
+		out.Value = &value
+		out.Raw = trimRaw(p.Raw)
+	}
+	return out
+}
+
+func portRangeJSONOf(p sysctl.PortRange) portRangeJSON {
+	out := portRangeJSON{Path: p.Path, Error: p.Err}
+	if p.Known() {
+		low, high := int(p.Low), int(p.High)
+		out.Measured = true
+		out.Low, out.High = &low, &high
+		out.Raw = trimRaw(p.Raw)
+	}
+	return out
+}
+
+func reservedPortsJSONOf(r sysctl.ReservedPorts) reservedPortsJSON {
+	out := reservedPortsJSON{
+		Measured: r.Known(),
+		Present:  !r.Absent(),
+		Ports:    make([]string, 0, len(r.Intervals)),
+		Path:     r.Path,
+		Error:    r.Err,
+	}
+	for _, iv := range r.Intervals {
+		out.Ports = append(out.Ports, iv.String())
+	}
+	if r.Known() {
+		out.Raw = trimRaw(r.Raw)
+	}
+	return out
+}
+
+func bindV6OnlyJSONOf(b sysctl.BindV6Only) bindV6OnlyJSON {
+	out := bindV6OnlyJSON{Path: b.Path, Error: b.Err}
+	if v, ok := b.Value(); ok {
+		value := v
+		out.Measured = true
+		out.Value = &value
+		out.Raw = trimRaw(b.Raw)
+	}
+	return out
+}
+
+// buildPortReport turns one verdict into the JSON document. It is a separate
+// function because the two-protocol report embeds two of them.
+func buildPortReport(v verdict.Verdict) portReport {
+	rep := portReport{
+		SchemaVersion: schemaVersion,
+		Target:        v.Query.Addr.String(),
+		Proto:         v.Query.Proto.String(),
+		Kind:          string(v.Kind),
+		Findings:      make([]portFinding, 0, len(v.Findings)),
+		Reasons:       make([]reasonJSON, 0, len(v.Reasons)),
+		Evidence: portEvidence{
+			TablesRead:            v.TablesRead,
+			TablesUnreadable:      v.TablesUnreadable,
+			ProcsRead:             v.ProcsRead,
+			ProcsDenied:           v.ProcsDenied,
+			BindV6Only:            bindV6OnlyJSONOf(v.V6Only),
+			EphemeralRange:        portRangeJSONOf(v.Ephemeral),
+			ReservedPorts:         reservedPortsJSONOf(v.Reserved),
+			NetNS:                 netnsJSONOf(v.NetNS),
+			UnprivilegedPortStart: privStartJSONOf(v.Privileged),
+		},
+		Version: version.Resolve().Version,
+	}
+	if rep.Evidence.TablesUnreadable == nil {
+		rep.Evidence.TablesUnreadable = []string{}
+	}
+	for _, f := range v.Findings {
+		jf := portFinding{
+			State:  f.Socket.State.String(),
+			Effect: f.Socket.Binding().String(),
+			Local:  f.Socket.Local.String(),
+			Inode:  f.Socket.Inode,
+			Table:  f.Socket.Table,
+			Owners: ownersJSON(f.Owners),
+		}
+		if f.Socket.Remote.Port != 0 {
+			jf.Remote = f.Socket.Remote.String()
+		}
+		rep.Findings = append(rep.Findings, jf)
+	}
+	if v.All != nil {
+		rows := make([]portRow, 0, len(v.All))
+		for _, r := range v.All {
+			jr := portRow{
+				Match:  string(r.Match),
+				State:  r.Socket.State.String(),
+				Effect: r.Socket.Binding().String(),
+				Local:  r.Socket.Local.String(),
+				Inode:  r.Socket.Inode,
+				Table:  r.Socket.Table,
+				Owners: ownersJSON(r.Owners),
+			}
+			if r.Socket.Remote.Port != 0 {
+				jr.Remote = r.Socket.Remote.String()
+			}
+			rows = append(rows, jr)
+		}
+		rep.Rows = &rows
+	}
+	if len(v.Probe) > 0 {
+		jp := portProbe{
+			Attempts: make([]probeAttemptJSON, 0, len(v.Probe)),
+			Note: "one bind() per attempt at the time shown, listen() never called, socket closed " +
+				"immediately; the port may be taken or released afterwards",
+		}
+		for _, a := range v.Probe {
+			jp.Attempts = append(jp.Attempts, probeAttemptJSON{
+				Mode:             string(a.Mode),
+				At:               a.At.Format(time.RFC3339),
+				Outcome:          string(a.Outcome),
+				Errno:            a.Errno,
+				Message:          a.Message,
+				Error:            a.Err,
+				UsableAsEvidence: a.Trustworthy(),
+			})
+		}
+		rep.Probe = &jp
+	}
+	for _, r := range v.Reasons {
+		rep.Reasons = append(rep.Reasons, reasonJSON{Code: r.Code, Detail: r.Detail})
+	}
+	return rep
+}
+
+func buildUnixReport(v verdict.UnixVerdict) unixReport {
+	rep := unixReport{
+		SchemaVersion: schemaVersion,
+		Target:        v.Query.Name,
+		Abstract:      v.Query.Abstract,
+		Kind:          string(v.Kind),
+		Holders:       make([]unixHolderJSON, 0, len(v.Holders)),
+		Reasons:       make([]reasonJSON, 0, len(v.Reasons)),
+		Evidence: unixEvidenceJSON{
+			TableRead:   v.TableRead,
+			TableError:  v.TableErr,
+			ProcsRead:   v.ProcsRead,
+			ProcsDenied: v.ProcsDenied,
+		},
+		Version: version.Resolve().Version,
+	}
+	if !v.Query.Abstract {
+		rep.Path = &unixPathJSON{
+			Measured: v.Path.Measured,
+			Exists:   v.Path.Exists,
+			Kind:     v.Path.Kind,
+			Error:    v.Path.Err,
+		}
+	}
+	for _, h := range v.Holders {
+		rep.Holders = append(rep.Holders, unixHolderJSON{
+			Inode:     h.Socket.Inode,
+			Type:      h.Socket.Type.String(),
+			State:     h.Socket.State.String(),
+			Listening: h.Socket.Listening(),
+			Owners:    ownersJSON(h.Owners),
+		})
+	}
+	for _, r := range v.Reasons {
+		rep.Reasons = append(rep.Reasons, reasonJSON{Code: r.Code, Detail: r.Detail})
+	}
+	return rep
+}
+
+// renderJSON and renderJSONBoth are the two entry points the CLI uses; they
+// exist so the call sites read as "render", not as "build then encode".
+func renderJSON(w io.Writer, v verdict.Verdict) error {
+	return encodeJSON(w, buildPortReport(v))
+}
+
+func renderJSONBoth(w io.Writer, tcp, udp verdict.Verdict) error {
+	return encodeJSON(w, bothReport{
+		SchemaVersion: schemaVersion,
+		Target:        tcp.Query.Addr.String(),
+		Both:          true,
+		ExitFrom:      "tcp",
+		TCP:           buildPortReport(tcp),
+		UDP:           buildPortReport(udp),
+	})
+}
+
+// trimRaw strips the newline a /proc/sys file ends with. The raw text is kept
+// in the document for a reader who wants to see exactly what the kernel said.
+func trimRaw(s string) string { return strings.TrimSpace(s) }
+
+// encodeJSON writes one document. Indented for a human reading a report, and
+// without a trailing blank line beyond the one Encode adds.
+func encodeJSON(w io.Writer, payload any) error {
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(payload); err != nil {
+		return fmt.Errorf("encode json: %w", err)
+	}
+	return nil
+}
