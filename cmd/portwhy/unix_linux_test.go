@@ -282,3 +282,56 @@ func TestUnixPrefixIsStripped(t *testing.T) {
 		t.Errorf("the report does not name the bare path:\n%s", out)
 	}
 }
+
+// A kernel without /proc/net/unix and a procfs this process may not open both
+// leave the question unanswered, and they are different facts: one is about the
+// kernel, the other about access to it. The JSON has to say which one happened —
+// read=false on its own cannot.
+func TestUnixJSONTellsAMissingTableFromAnUnreadableOne(t *testing.T) {
+	readTable := func(t *testing.T, dir string) (code int, table struct {
+		Read    bool   `json:"read"`
+		Present bool   `json:"present"`
+		Error   string `json:"error"`
+	}) {
+		t.Helper()
+		code, out, errb := runCLI(t, "unix", "@x", "-json", "-tables", dir, "-no-holders")
+		var rep struct {
+			Evidence struct {
+				Table struct {
+					Read    bool   `json:"read"`
+					Present bool   `json:"present"`
+					Error   string `json:"error"`
+				} `json:"table"`
+			} `json:"evidence"`
+		}
+		if err := json.Unmarshal([]byte(out), &rep); err != nil {
+			t.Fatalf("bad JSON: %v\n%s\nstderr: %s", err, out, errb)
+		}
+		return code, rep.Evidence.Table
+	}
+
+	// No file at all: the kernel does not offer the table.
+	missing, table := readTable(t, tablesDir(t, nil))
+	if missing != exitUnknown {
+		t.Errorf("missing table: exit = %d, want %d", missing, exitUnknown)
+	}
+	if table.Read || table.Present {
+		t.Errorf("missing table: read=%v present=%v, want false/false", table.Read, table.Present)
+	}
+	if table.Error == "" {
+		t.Error("missing table: no error recorded")
+	}
+
+	// A file that exists and is not a table: the kernel offers it, we could not
+	// read it.
+	broken, table := readTable(t, tablesDir(t, map[string]string{"unix": "this is not a table\n"}))
+	if broken != exitUnknown {
+		t.Errorf("unreadable table: exit = %d, want %d", broken, exitUnknown)
+	}
+	if table.Read || !table.Present {
+		t.Errorf("unreadable table: read=%v present=%v, want false/true", table.Read, table.Present)
+	}
+	if table.Error == "" {
+		t.Error("unreadable table: no error recorded")
+	}
+}
