@@ -441,6 +441,7 @@ portwhy version
 | `-all` | also list every row that mentions the port, with why it did or did not take part (the verdict does not change) |
 | `-probe` | attempt a real `bind()` twice — plain, then `SO_REUSEADDR` — and report what the kernel answered. Never calls `listen()`. tcp only, so it is a usage error together with `-proto udp` or `-proto both` |
 | `-no-holders` | skip the `/proc/<pid>/fd` walk: kernel state only |
+| `-batch` | read targets from stdin, one per line, and write one JSON object per line. Takes no target argument; refuses `-probe` (each target would be a real bind) |
 | `-tables DIR` | read the socket tables from DIR instead of `/proc/net` |
 | `-sysctl DIR` | read the tunables from DIR instead of `/proc/sys`: `net/ipv6/bindv6only`, `net/ipv4/ip_local_port_range`, `net/ipv4/ip_local_reserved_ports`, `net/ipv4/ip_unprivileged_port_start` |
 | `-proc ROOT` | use ROOT instead of `/proc` when naming the holder and when naming this process's network namespace |
@@ -474,6 +475,48 @@ A script that treats every non-zero code as "taken" will do the wrong thing on
 With `--probe`, a 0 can become a 3: the tables said nothing held the address and
 a `bind()` proved otherwise. The other direction never happens — no flag turns a
 3 into a 0.
+
+### JSON output and the batch stream
+
+`-json` prints one document with `schema_version` in it. The full field list —
+type, when each field appears, and what its absence means — is
+[docs/json-schema.md](docs/json-schema.md), and it is checked against the types by
+a test that fails in both directions: a field the code emits and the document
+omits, or a field the document promises and the code never emits.
+
+The rule the document spends most of its words on is the same rule the tool
+applies to its own evidence: **a field that was not measured is absent or null,
+never zero.** `"procs_read": 0` used to be able to mean "the walk was skipped" and
+"the walk found no process" at once, which is the JSON version of answering
+`free` for a table that could not be read. It is now
+`"holder_lookup": {"attempted": false, "procs_read": null}`.
+
+`-batch` answers many targets in one run:
+
+```
+$ printf '127.0.0.1:80\n127.0.0.1:443\n' | portwhy why -batch
+{"schema_version":1,"target":"127.0.0.1:80","proto":"tcp","kind":"listening",...}
+{"schema_version":1,"target":"127.0.0.1:443","proto":"tcp","kind":"listening",...}
+```
+
+What a consumer can rely on:
+
+- one object per line, parseable on its own (`jq -c .` on any line succeeds);
+- output order matches input order, so a line is matched back to what was asked;
+- a line that is not a target gets its own object with `kind: "usage"`, an
+  `error`, and no `evidence`, and the other lines still run;
+- blank lines are not targets; a batch with none at all is a usage error, because
+  "nothing was asked" must never read as "nothing is in the way";
+- the tables are read once, before the first line, so every answer in one batch
+  describes the same instant;
+- the exit code is the most severe line's: `usage (2)` > `unknown (3)` >
+  `taken (1)` > `free (0)`. Usage outranks unknown because it is a statement
+  about the whole run; unknown outranks taken because a monitor with a blind spot
+  is worse off than one that found a busy port.
+
+`-probe` is refused with `-batch`: every target would be a real `bind()`, and N
+side effects have to be opted into one target at a time. `portwhy unix` has no
+batch mode — a unix name is a different question with a different document.
 
 ## What it does not do
 

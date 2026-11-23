@@ -473,6 +473,16 @@ Each of these is a test today, and each is a way the tool could become harmful:
   measurement (a count, an inode) or it is not printed.
 - The zero-value path measurement must produce `unknown`, never `free`: a caller
   that forgot to look has not established that nothing is there.
+- A skipped holder walk must be spelled as "not attempted" (`procs_read: null`),
+  never as a count of 0: the JSON version of `free` for a table nobody read.
+- A field the code emits and `docs/json-schema.md` omits must fail the build, and
+  so must a field the document promises and the code never emits. A document that
+  cannot be read must fail the gate rather than skip it.
+- A batch line whose answer is `unknown` must keep the whole batch from exiting 0.
+- A batch line that is not a target must not change any other line's answer, and
+  must still produce exactly one object.
+- An empty batch must exit 2 with nothing on stdout: "nothing was asked" is not
+  "nothing is in the way".
 
 ## 6. What the probe does, and what is still later
 
@@ -504,3 +514,78 @@ under pressure:
 - A probe result is labelled with the moment it was taken. Between the probe and
   the user's own `bind()`, the state can change; the report must not present a
   probe as a guarantee.
+
+## 7. The output contract, and the batch stream
+
+The machine-readable output is a second product surface, and it fails in the same
+way the text one does: not by being wrong loudly, but by being ambiguous quietly.
+Three decisions follow from that.
+
+**The shapes are types, not local variables.** They used to be anonymous structs
+inside the render functions, which made the file format a side effect of where a
+variable was declared and made the tags unreachable from a test. They are now
+package-level types in `cmd/portwhy/jsonreport.go`, and every document carries
+`schema_version` (an integer; the program version is a different field). Adding an
+optional field does not bump it; changing a type, a name, or a meaning does.
+
+**A zero value is never a measurement.** `procs_read: 0` could mean "the walk was
+skipped" and "the walk read no process", which is the JSON spelling of answering
+`free` from a table nobody read. Holder lookup is now
+`{attempted, procs_read, procs_denied, error}` with the counts `null` until a walk
+completes, and `null` again when it fails — a count from a failed walk is not a
+count. The same treatment applies to the unix table (`{read, present, error}`,
+because a kernel without `/proc/net/unix` and a procfs this process may not open
+are different worlds) and to `tables_unreadable[]` (`{name, present, error}`).
+`version` sits outside `evidence` on purpose: it is not evidence about a port.
+
+**The document is checked, not trusted.** `TestJSONSchemaDocumentMatchesTheTypes`
+walks the types with reflection and compares them to the tables in
+`docs/json-schema.md` in both directions. The gate reads the file itself, so a
+deleted document fails instead of passing. The prose rules the gate cannot check —
+numbers come only from measurements, risk never becomes a kind, a missing table of
+the other address family is not a hole — are stated in the document and tested by
+behaviour.
+
+### The batch stream
+
+`-batch` reads targets from stdin and writes one compact object per line. The
+single-target rules apply N times; what batch adds is a shape a stream consumer can
+parse without knowing how many answers were asked for.
+
+- **Line N of the output is line N of the input**, counting non-blank lines. That
+  is the correlation rule; `target` states the question in normalised form
+  (`:9000` becomes `0.0.0.0:9000`), and no extra field is added to say what was
+  typed, because the order already carries it and a second field would be a second
+  answer to the same question.
+- **A line that is not a question is still an object**, with `kind: "usage"`, an
+  `error`, and no `evidence`. Nothing was measured, so an empty evidence object
+  would be a claim that something was.
+- **The exit code is the most severe line's**: `usage > unknown > taken > free`.
+  The order is not numeric on purpose. Usage outranks unknown because it describes
+  the whole run; unknown outranks taken because a blind spot is worse news than a
+  busy port.
+- **Each line is flushed as it is written.** A consumer reading a pipe sees answers
+  as they are produced. This is a test, not a habit: a buffer that only fills at
+  exit would pass every other assertion in the file.
+- **The tables are read once, before the first line.** Every answer in one batch
+  describes the same instant. Re-reading per line would be more current and less
+  useful: a monitor cannot compare 200 answers taken at 200 instants.
+- **Two refusals.** `-probe` is refused because N targets would be N real
+  `bind()`s, and side effects have to be opted into one at a time. `unix` has no
+  batch mode because a unix name is a different question with a different document,
+  and a stream mixing the two would make every consumer branch on shape before it
+  could read a kind.
+
+### One open question
+
+While writing the batch tests, a fixture accidentally put two table rows on one
+line. The parser accepted it: it reads the columns it knows by position and
+ignores the rest, which is what lets a kernel add a column without breaking the
+tool. The target that should have been answered from the second row was answered
+`free`.
+
+`/proc/net/tcp` is kernel-generated, so this is not reachable from a real table —
+but a truncated capture or a hand-written fixture can do it, and the result is a
+`free` about a row that was silently dropped. Whether to bound the column count
+(a line with far more fields than any kernel writes is not a row) is a question for
+the hardening day, not a change to make while adding an output contract.
