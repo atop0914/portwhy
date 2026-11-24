@@ -559,14 +559,17 @@ func renderWaitStop(w io.Writer, res wait.Result) error {
 	return fprintf(w, "  stopped at t+%s: %s\n", seconds(at), res.Stop)
 }
 
-// waitNoteText spells the two cases where a round's kind is not the table's own
-// answer. Silence means the two agreed, which needs no sentence.
+// waitNoteText spells the cases where a round's kind is not the table's own
+// answer. Silence means there is nothing to add: either the two agreed, or the
+// table could not answer and the round's holes already say so.
 func waitNoteText(note string) string {
 	switch note {
 	case wait.NoteBindRefusedWithNoRow:
-		return "the tables had no row for it and the bind was refused anyway"
+		return "the tables were readable, had no row for it, and the bind was refused anyway"
 	case wait.NoteTableSaidTaken:
 		return "the tables still showed a holder when this bind was accepted"
+	case wait.NoteBlindTable:
+		return "a socket table could not be read this round"
 	}
 	return ""
 }

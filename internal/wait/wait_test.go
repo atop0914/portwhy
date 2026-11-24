@@ -74,7 +74,10 @@ func TestJudgeNeverInventsFreeWithoutAnAcceptedBind(t *testing.T) {
 		{"free and accepted", verdict.KindFree, bound(), verdict.KindFree, "", ""},
 		{"taken but accepted", verdict.KindListening, bound(), verdict.KindFree, "", NoteTableSaidTaken},
 		{"free but refused", verdict.KindFree, refused(), verdict.KindUnknown, "", NoteBindRefusedWithNoRow},
-		{"unreadable and refused", verdict.KindUnknown, refused(), verdict.KindUnknown, "", NoteBindRefusedWithNoRow},
+		// An unknown table and a refusal: the round is unknown and the note stays
+		// empty, because "the tables had no row" would be a reading nobody made —
+		// the same fixture with a hole gets NoteBlindTable, tested below.
+		{"unreadable and refused", verdict.KindUnknown, refused(), verdict.KindUnknown, "", ""},
 		{"listening and refused", verdict.KindListening, refused(), verdict.KindListening, "", ""},
 		{"time-wait and refused", verdict.KindTimeWaitOnly, refused(), verdict.KindTimeWaitOnly, "", ""},
 		{"bound udp and refused", verdict.KindBound, refused(), verdict.KindBound, "", ""},
@@ -151,6 +154,26 @@ func TestJudgeKeepsTheHolesOfItsRound(t *testing.T) {
 	}
 	if r.Kind != verdict.KindUnknown {
 		t.Errorf("kind = %s, want unknown", r.Kind)
+	}
+	if r.Note != NoteBlindTable {
+		t.Errorf("note = %q, want %q: the round has no table answer at all",
+			r.Note, NoteBlindTable)
+	}
+}
+
+// The same hole on a round whose bind was accepted: the success stands, and the
+// note must not claim the tables "still showed a holder" — they showed nothing.
+func TestJudgeDoesNotAccuseATableItCouldNotRead(t *testing.T) {
+	v := verdict.Verdict{
+		Kind:             verdict.KindUnknown,
+		TablesUnreadable: []verdict.TableHole{{Name: "tcp", Err: "permission denied"}},
+	}
+	r := Judge(v, bound())
+	if r.Kind != verdict.KindFree {
+		t.Fatalf("kind = %s, want free: the bind was accepted", r.Kind)
+	}
+	if r.Note != "" {
+		t.Errorf("note = %q, want empty: no reading was compared", r.Note)
 	}
 }
 

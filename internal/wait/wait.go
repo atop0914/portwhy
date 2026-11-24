@@ -68,15 +68,28 @@ const (
 
 // Notes record that a round's answer is not the table's own answer.
 const (
-	// NoteBindRefusedWithNoRow is the bind-without-listen hole: the tables say
-	// free and a plain bind is refused anyway. Free would be a lie and taken
-	// would name a holder no table lists, so the round is unknown.
+	// NoteBindRefusedWithNoRow is the bind-without-listen hole: the tables were
+	// readable, said free, and a plain bind was refused anyway. Free would be a
+	// lie and taken would name a holder no table lists, so the round is unknown.
 	NoteBindRefusedWithNoRow = "bind-refused-with-no-row"
 	// NoteTableSaidTaken records that the bind was accepted while the table, read
 	// a moment earlier, still showed a holder: the port was released in between,
 	// which is exactly what the caller is waiting for.
 	NoteTableSaidTaken = "table-said-taken-bind-accepted"
+	// NoteBlindTable marks a round whose tables could not be read. The bind result
+	// still stands, but the diagnosis behind the round was blind, and a reader who
+	// saw only "unknown" would not know whether the table was empty or missing.
+	NoteBlindTable = "table-unreadable-this-round"
 )
+
+// holding reports whether a kind claims something occupies the address.
+//
+// "free" and "unknown" say the opposite in two different ways, and a note that
+// said the tables "still showed a holder" about either of them would be inventing
+// a finding.
+func holding(k verdict.Kind) bool {
+	return k != verdict.KindFree && k != verdict.KindUnknown && k != ""
+}
 
 // Round is one observation: the tables at one instant, and the plain bind that
 // followed it immediately.
@@ -121,14 +134,25 @@ func Judge(table verdict.Verdict, bind probe.Attempt) Round {
 		}
 	case bind.Outcome == probe.OutcomeBound:
 		r.Kind = verdict.KindFree
-		if table.Kind != verdict.KindFree {
+		// A table that also failed to read cannot reach here with a holding kind:
+		// a hole forces the verdict to unknown. So this note is only about a real
+		// disagreement — the port was let go between the two measurements.
+		if holding(table.Kind) {
 			r.Note = NoteTableSaidTaken
 		}
 	case bind.Outcome == probe.OutcomeAddrInUse:
 		switch table.Kind {
-		case verdict.KindFree, verdict.KindUnknown:
+		case verdict.KindFree:
 			r.Kind = verdict.KindUnknown
 			r.Note = NoteBindRefusedWithNoRow
+		case verdict.KindUnknown:
+			// The table could not answer either — a hole, an unrecognised state
+			// code, an unresolved wildcard. Nothing can be added to that, and a
+			// note claiming "no row" would be inventing a reading.
+			r.Kind = verdict.KindUnknown
+			if len(r.Holes) > 0 {
+				r.Note = NoteBlindTable
+			}
 		default:
 			// The tables explain the refusal, so this round carries their answer:
 			// listening, bound, time-wait-only, or another holding state.

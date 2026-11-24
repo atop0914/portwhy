@@ -126,7 +126,7 @@ func TestWaitTreatsABindWithoutListenAsUnknown(t *testing.T) {
 		t.Fatalf("exit = %d, want %d (unknown): a refused bind with no row is not taken either (stderr: %s)\n%s",
 			code, exitUnknown, errb, out)
 	}
-	if !strings.Contains(out, "the tables had no row for it and the bind was refused anyway") {
+	if !strings.Contains(out, "the tables were readable, had no row for it, and the bind was refused anyway") {
 		t.Errorf("output does not explain the disagreement it acted on:\n%s", out)
 	}
 }

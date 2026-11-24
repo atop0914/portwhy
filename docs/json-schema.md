@@ -209,7 +209,7 @@ other case, which the tests assert over every combination.
 | `timeline[].at_ms` | integer | always within an element | never absent; monotonic milliseconds since the first round |
 | `timeline[].kind` | string | always within an element | never absent; what that round supports once its bind is taken into account |
 | `timeline[].table_kind` | string | always within an element | never absent; what the tables alone said, kept so a disagreement is visible |
-| `timeline[].note` | string | only when the two disagreed | absent means the tables and the bind agreed |
+| `timeline[].note` | string | when the round's answer is not the table's own | absent means there was nothing to report: either the two agreed, or the table could not answer. The values are `bind-refused-with-no-row` (the tables were readable and silent, and the bind was refused anyway), `table-said-taken-bind-accepted` (a holder let go between the two measurements), and `table-unreadable-this-round` |
 | `timeline[].stop` | string | only on the round that stopped the wait | absent means the round let the wait continue |
 | `timeline[].bind.outcome` | string | always within an element | never absent; `bound`, `addr-in-use`, `not-permitted`, `addr-not-available`, `failed` or `not-run` |
 | `timeline[].bind.errno` | string | only when the kernel named one | absent means no errno was involved (success, or a failed `socket()`) |
