@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-// Bind asks the kernel for one address, once.
+// Bind asks the kernel for one stream address, once.
 //
 // The socket is created, the option (if any) is set, bind() is called, and the
 // descriptor is closed. listen() is never called: a bound socket that never
@@ -18,6 +18,25 @@ import (
 // it is asked about. The window in which this process holds the address is one
 // syscall long.
 func Bind(ap netip.AddrPort, mode Mode) Attempt {
+	return attempt(ap, syscall.SOCK_STREAM, syscall.IPPROTO_TCP, mode)
+}
+
+// BindUDP asks the kernel for one datagram address, once.
+//
+// It is a separate function rather than a mode of Bind because the socket type
+// is not an option: a stream bind and a datagram bind are two namespaces, and a
+// TCP listener on a port leaves the UDP bind free. The attempt still never
+// connects and never reads: it holds the address for the length of one syscall
+// and closes.
+//
+// There is no SO_REUSEADDR variant here. On UDP that option means "share the
+// port with another binder", which answers a different question from "is the
+// port free" — and a shared bind succeeding is not evidence about a plain one.
+func BindUDP(ap netip.AddrPort) Attempt {
+	return attempt(ap, syscall.SOCK_DGRAM, syscall.IPPROTO_UDP, ModePlain)
+}
+
+func attempt(ap netip.AddrPort, sockType, ipProto int, mode Mode) Attempt {
 	res := Attempt{Mode: mode, At: time.Now().UTC()}
 
 	switch mode {
@@ -35,7 +54,7 @@ func Bind(ap netip.AddrPort, mode Mode) Attempt {
 		return res
 	}
 
-	fd, err := syscall.Socket(family, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, syscall.IPPROTO_TCP)
+	fd, err := syscall.Socket(family, sockType|syscall.SOCK_CLOEXEC, ipProto)
 	if err != nil {
 		res.Outcome = OutcomeNotRun
 		res.Err = "socket: " + err.Error()

@@ -32,3 +32,14 @@ func Bind(ap netip.AddrPort, mode Mode) Attempt {
 func Both(ap netip.AddrPort) []Attempt {
 	return []Attempt{Bind(ap, ModePlain), Bind(ap, ModeReuseAddr)}
 }
+
+// BindUDP refuses for the same reason. A platform without this probe must say
+// so; a caller that ignores it gets OutcomeNotRun, which is not evidence.
+func BindUDP(ap netip.AddrPort) Attempt {
+	return Attempt{
+		Mode:    ModePlain,
+		At:      time.Now().UTC(),
+		Outcome: OutcomeNotRun,
+		Err:     errors.Join(ErrUnsupported, errors.New(runtime.GOOS)).Error(),
+	}
+}

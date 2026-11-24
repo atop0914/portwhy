@@ -227,3 +227,80 @@ func TestProbeSourceNeverListens(t *testing.T) {
 		}
 	}
 }
+
+// heldUDP returns an address a real datagram socket is bound to.
+func heldUDP(t *testing.T) (netip.AddrPort, net.PacketConn) {
+	t.Helper()
+	pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen packet: %v", err)
+	}
+	ap := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), uint16(pc.LocalAddr().(*net.UDPAddr).Port))
+	return ap, pc
+}
+
+// freeUDPPort asks the kernel for a datagram port and gives it back.
+func freeUDPPort(t *testing.T) netip.AddrPort {
+	t.Helper()
+	pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen packet: %v", err)
+	}
+	ap := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), uint16(pc.LocalAddr().(*net.UDPAddr).Port))
+	if err := pc.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	return ap
+}
+
+func TestBindUDPOnHeldDatagramAddressIsAddrInUse(t *testing.T) {
+	ap, pc := heldUDP(t)
+	defer pc.Close()
+
+	a := BindUDP(ap)
+	if a.Outcome != OutcomeAddrInUse {
+		t.Fatalf("outcome = %s (%s %s), want %s", a.Outcome, a.Errno, a.Message, OutcomeAddrInUse)
+	}
+	if a.Errno != "EADDRINUSE" {
+		t.Errorf("errno = %q, want EADDRINUSE", a.Errno)
+	}
+	if !a.Trustworthy() {
+		t.Errorf("attempt not trustworthy: %q", a.Err)
+	}
+}
+
+// The two directions of the same claim: a stream bind and a datagram bind are
+// independent namespaces, so neither may be reported as evidence about the
+// other. Each half is exercised with a real socket, because a rule about
+// namespaces cannot be checked against a table.
+func TestTCPAndUDPBindsDoNotBlockEachOther(t *testing.T) {
+	tcpAddr, ln := heldPort(t)
+	defer ln.Close()
+	if a := BindUDP(tcpAddr); a.Outcome != OutcomeBound {
+		t.Fatalf("a tcp listener made the udp bind fail: %s (%s %s)", a.Outcome, a.Errno, a.Message)
+	}
+
+	udpAddr, pc := heldUDP(t)
+	defer pc.Close()
+	if a := Bind(udpAddr, ModePlain); a.Outcome != OutcomeBound {
+		t.Fatalf("a bound udp socket made the tcp bind fail: %s (%s %s)", a.Outcome, a.Errno, a.Message)
+	}
+}
+
+// Same rule as the stream probe: the address must be free again the instant the
+// attempt returns, or the tool becomes the holder it is asked to find.
+func TestBindUDPReleasesTheAddress(t *testing.T) {
+	ap := freeUDPPort(t)
+	for i := 0; i < 5; i++ {
+		if a := BindUDP(ap); a.Outcome != OutcomeBound {
+			t.Fatalf("attempt %d: outcome = %s (%s %s), want %s", i+1, a.Outcome, a.Errno, a.Message, OutcomeBound)
+		}
+	}
+	pc, err := net.ListenPacket("udp4", ap.String())
+	if err != nil {
+		t.Fatalf("the probe kept the datagram address: %v", err)
+	}
+	if err := pc.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+}
