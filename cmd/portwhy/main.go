@@ -24,6 +24,7 @@ import (
 	"github.com/atop0914/portwhy/internal/unixsock"
 	"github.com/atop0914/portwhy/internal/verdict"
 	"github.com/atop0914/portwhy/internal/version"
+	"github.com/atop0914/portwhy/internal/wait"
 )
 
 // Exit codes are a contract, and the contract is the point: a script that treats
@@ -50,6 +51,8 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	switch args[0] {
 	case "why":
 		return runWhy(args[1:], stdin, stdout, stderr)
+	case "wait":
+		return runWait(args[1:], stdout, stderr)
 	case "unix":
 		return runUnix(args[1:], stdout, stderr)
 	case "states":
@@ -261,6 +264,303 @@ func runWhy(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	// listener; the report prints the UDP answer and the code it would have had,
 	// so the choice is stated rather than hidden.
 	return exitCode(tcp.Kind)
+}
+
+// waitFloor is the shortest interval the command accepts.
+//
+// Every round is a real bind(). The floor is not politeness about CPU: it limits
+// how many times this tool may touch a port per second on a machine whose owner is
+// already debugging something.
+const waitFloor = 50 * time.Millisecond
+
+// runWait waits for a plain bind() to be accepted.
+//
+// It is a separate command rather than a flag on why, because it answers a
+// different question with a different answer shape: why describes one instant,
+// wait describes an interval and has to say how the interval ended. The one
+// thing they share is the rule that a gap in the evidence is never an answer.
+func runWait(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("wait", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	proto := fs.String("proto", "tcp", "protocol to wait for: tcp or udp")
+	timeout := fs.Duration("timeout", 30*time.Second, "deadline; 0 means no deadline")
+	interval := fs.Duration("interval", 500*time.Millisecond, "pause between attempts (minimum 50ms)")
+	until := fs.String("until-bindable", "bindable", "the only condition this version can wait for")
+	tableDir := fs.String("tables", procnet.DefaultDir, "directory holding the kernel socket tables")
+	sysctlDir := fs.String("sysctl", sysctl.DefaultDir, "directory holding the kernel tunables")
+	procRoot := fs.String("proc", sockid.DefaultRoot, "procfs root used to name the holder")
+	skipHolders := fs.Bool("no-holders", false, "do not walk /proc/<pid>/fd: kernel state only")
+
+	if err := fs.Parse(splitFlags(fs, args)); err != nil {
+		return exitUsage
+	}
+
+	protos, err := parseProtos(*proto)
+	if err != nil {
+		_ = fprintf(stderr, "portwhy: %v\n", err)
+		return exitUsage
+	}
+	if len(protos) != 1 {
+		// Two protocols would be two answers sharing one deadline and one timeline,
+		// and the timeline would have to say which of them it was drawing. Refusing
+		// is the only honest option: a merged line would be false about one of them.
+		_ = fprintf(stderr, "portwhy: -proto both asks two questions with one deadline. A tcp bind and "+
+			"a udp bind are independent namespaces, so one timeline could only describe one of them. "+
+			"Wait for one protocol at a time\n")
+		return exitUsage
+	}
+	if *interval < waitFloor {
+		_ = fprintf(stderr, "portwhy: -interval %s is below the %s floor: every round is a real bind(), "+
+			"and a tighter loop would hammer a port this tool is only supposed to observe\n",
+			*interval, waitFloor)
+		return exitUsage
+	}
+	if *timeout < 0 {
+		_ = fprintf(stderr, "portwhy: -timeout %s is negative; use 0 for no deadline\n", *timeout)
+		return exitUsage
+	}
+	if *until != "bindable" {
+		// Named rather than ignored: a flag that accepts anything and waits for one
+		// thing is a flag that lies about what it did.
+		_ = fprintf(stderr, "portwhy: -until-bindable %q is not a condition this version waits for. "+
+			"There is exactly one: bindable — a plain bind() the kernel accepts. Anything else "+
+			"would be a different command with a different answer\n", *until)
+		return exitUsage
+	}
+	if fs.NArg() != 1 {
+		_ = fprintf(stderr, "portwhy: wait takes exactly one target, got %d\n\n", fs.NArg())
+		_ = usage(stderr)
+		return exitUsage
+	}
+
+	addr, err := parseTarget(fs.Arg(0))
+	if err != nil {
+		_ = fprintf(stderr, "portwhy: %v\n", err)
+		return exitUsage
+	}
+	p := protos[0]
+	ap := netip.AddrPortFrom(addr.IP, addr.Port)
+
+	// last is the verdict of the most recent round. It is kept out of the loop's
+	// result on purpose: wait decides when to stop, and the verdict says what was
+	// seen — mixing the two would let a report explain a stop with evidence from
+	// a different round.
+	var last verdict.Verdict
+	observe := func() wait.Round {
+		// The tables are read again every round. Reusing the first read would make
+		// one instant's evidence describe the whole timeline, which is exactly the
+		// kind of quiet fiction this project exists to avoid.
+		tables, env := loadEvidence(*tableDir, *sysctlDir, *procRoot, *skipHolders, io.Discard)
+		v := verdict.Explain(verdict.Query{Addr: addr, Proto: p}, tables, env)
+		last = v
+		// Plain only. SO_REUSEADDR would succeed on a TIME_WAIT reservation, and
+		// reporting that as "you can bind now" would be wrong for the plain bind the
+		// caller is about to make.
+		var att probe.Attempt
+		if p == procnet.UDP {
+			att = probe.BindUDP(ap)
+		} else {
+			att = probe.Bind(ap, probe.ModePlain)
+		}
+		return wait.Judge(v, att)
+	}
+
+	res := wait.Run(wait.Options{Timeout: *timeout, Interval: *interval}, observe)
+
+	params := waitParams{Addr: addr, Proto: p, Timeout: *timeout, Interval: *interval}
+	if err := renderWaitText(stdout, res, last, params); err != nil {
+		_ = fprintf(stderr, "portwhy: writing report: %v\n", err)
+		return exitUsage
+	}
+	if res.End == wait.EndBound {
+		return exitFree
+	}
+	// A wait that did not end on an accepted bind reports the last round's code:
+	// 1 if something held the port, 3 if the evidence never supported an answer.
+	return exitCode(res.Kind)
+}
+
+// waitParams is what the renderer needs about the question, gathered so the
+// function signature stays about the answer.
+type waitParams struct {
+	Addr     procnet.Addr
+	Proto    procnet.Proto
+	Timeout  time.Duration
+	Interval time.Duration
+}
+
+// renderWaitText prints the timeline, how it ended, and what the answer does not
+// cover.
+func renderWaitText(w io.Writer, res wait.Result, last verdict.Verdict, p waitParams) error {
+	if err := fprintf(w, "portwhy wait %s/%s\n", p.Addr, p.Proto); err != nil {
+		return err
+	}
+	if p.Timeout > 0 {
+		if err := fprintf(w, "  timeout %s, interval %s; the only thing that ends this is a plain bind() "+
+			"the kernel accepts\n", dur(p.Timeout), dur(p.Interval)); err != nil {
+			return err
+		}
+	} else if err := fprintf(w, "  timeout none (-timeout 0): this waits with no deadline until a plain "+
+		"bind() is accepted\n  interval %s\n", dur(p.Interval)); err != nil {
+		return err
+	}
+
+	if err := fprintf(w, "\ntimeline\n"); err != nil {
+		return err
+	}
+	var prev verdict.Kind
+	for i, r := range res.Timeline {
+		line := string(r.Kind)
+		if note := waitNoteText(r.Note); note != "" {
+			line += " — " + note
+		}
+		if i > 0 && r.Kind != prev {
+			line += fmt.Sprintf(" (changed from %s)", prev)
+		}
+		if err := fprintf(w, "  %-10s round %-4d %s\n", "t+"+seconds(r.At), r.Index, line); err != nil {
+			return err
+		}
+		prev = r.Kind
+	}
+
+	if err := fprintf(w, "\nresult\n"); err != nil {
+		return err
+	}
+	switch res.End {
+	case wait.EndBound:
+		if err := fprintf(w, "  bindable: a plain bind() was accepted at t+%s, after %d attempt(s) in %s\n",
+			seconds(res.Waited), res.Attempts, dur(res.Waited)); err != nil {
+			return err
+		}
+	case wait.EndTimeout:
+		if res.Kind == verdict.KindUnknown {
+			if err := fprintf(w, "  not bindable at the deadline: the last round still answered %q\n"+
+				"    the evidence it needed was missing, so no round could say the port was free — "+
+				"%d attempt(s), none accepted, %s waited\n",
+				string(res.Kind), res.Attempts, dur(res.Waited)); err != nil {
+				return err
+			}
+		} else if err := fprintf(w, "  not bindable at the deadline: the last round still answered %q\n"+
+			"    %s — %d attempt(s), none accepted, %s waited\n",
+			string(res.Kind), kindSentence[res.Kind], res.Attempts, dur(res.Waited)); err != nil {
+			return err
+		}
+	case wait.EndStopped:
+		if err := renderWaitStop(w, res); err != nil {
+			return err
+		}
+	}
+
+	// Who is holding it is the actionable half of a failed wait, so it is printed
+	// next to the result and only when the wait failed: after a successful bind
+	// this list would describe a socket that has just let go.
+	if res.End != wait.EndBound && len(last.Findings) > 0 {
+		if err := fprintf(w, "\nstill held by, as of the last round\n"); err != nil {
+			return err
+		}
+		for _, f := range last.Findings {
+			if err := fprintf(w, "  %-14s %-22s %-28s inode %d\n", f.Socket.State,
+				f.Socket.Local.String(), ownerText(f.Owners, f.Socket.Inode), f.Socket.Inode); err != nil {
+				return err
+			}
+		}
+	}
+
+	hasLimits := res.Unreadable > 0 || last.ProcsRead > 0 || last.HoldersErr != ""
+	if hasLimits {
+		if err := fprintf(w, "\nlimits\n"); err != nil {
+			return err
+		}
+		if res.Unreadable > 0 {
+			if err := fprintf(w, "  - %d of %d round(s) could not read the socket table; those rounds "+
+				"answered unknown, never free\n", res.Unreadable, res.Rounds); err != nil {
+				return err
+			}
+		}
+		if last.ProcsRead > 0 {
+			if err := fprintf(w, "  - holder lookup walked %d process(es), %d not readable\n",
+				last.ProcsRead, last.ProcsDenied); err != nil {
+				return err
+			}
+		}
+		if last.HoldersErr != "" {
+			if err := fprintf(w, "  - holder lookup did not run: %s\n", last.HoldersErr); err != nil {
+				return err
+			}
+		}
+	}
+
+	return fprintf(w, "\nnote\n"+
+		"  every round is a real bind(): listen() is never called and the socket is closed at\n"+
+		"  once. A refused bind changes nothing; the one that is accepted holds the address for\n"+
+		"  the length of a single syscall. Each round is true of its own instant — the port can\n"+
+		"  be taken again the moment the attempt returns.\n")
+}
+
+// renderWaitStop explains an end that no amount of waiting would have changed.
+func renderWaitStop(w io.Writer, res wait.Result) error {
+	var b probe.Attempt
+	var at time.Duration
+	if n := len(res.Timeline); n > 0 {
+		b = res.Timeline[n-1].Bind
+		at = res.Timeline[n-1].At
+	}
+	switch res.Stop {
+	case wait.StopNotPermitted:
+		return fprintf(w, "  stopped at t+%s: the kernel refused the bind with %s (%s)\n"+
+			"    below net.ipv4.ip_unprivileged_port_start a bind is refused before the address is\n"+
+			"    considered, so this is a capability boundary, not a busy port: waiting cannot change it\n",
+			seconds(at), errnoOr(b, "EACCES"), messageOr(b, "permission denied"))
+	case wait.StopAddrNotAvailable:
+		return fprintf(w, "  stopped at t+%s: the kernel refused the bind with %s (%s)\n"+
+			"    the address is not on this host, and no amount of waiting puts it there\n",
+			seconds(at), errnoOr(b, "EADDRNOTAVAIL"), messageOr(b, "cannot assign requested address"))
+	case wait.StopProbeFailed:
+		return fprintf(w, "  stopped at t+%s: bind() failed with %s (%s)\n"+
+			"    this build does not classify that errno, so nothing here can say whether waiting helps\n",
+			seconds(at), errnoOr(b, "?"), messageOr(b, "no message from the kernel"))
+	case wait.StopProbeNotRun, wait.StopProbeBroken:
+		return fprintf(w, "  stopped at t+%s: no usable bind was made (%s)\n"+
+			"    without a trustworthy attempt there is no evidence, and repeating it would produce\n"+
+			"    the same nothing\n", seconds(at), b.Err)
+	}
+	// A stop code without a sentence is a bug in this file, and printing nothing
+	// would be worse than printing the code: the code is still true.
+	return fprintf(w, "  stopped at t+%s: %s\n", seconds(at), res.Stop)
+}
+
+// waitNoteText spells the two cases where a round's kind is not the table's own
+// answer. Silence means the two agreed, which needs no sentence.
+func waitNoteText(note string) string {
+	switch note {
+	case wait.NoteBindRefusedWithNoRow:
+		return "the tables had no row for it and the bind was refused anyway"
+	case wait.NoteTableSaidTaken:
+		return "the tables still showed a holder when this bind was accepted"
+	}
+	return ""
+}
+
+func seconds(d time.Duration) string {
+	return fmt.Sprintf("%.3fs", d.Seconds())
+}
+
+func dur(d time.Duration) string {
+	return d.Round(time.Millisecond).String()
+}
+
+func errnoOr(a probe.Attempt, fallback string) string {
+	if a.Errno != "" {
+		return a.Errno
+	}
+	return fallback
+}
+
+func messageOr(a probe.Attempt, fallback string) string {
+	if a.Message != "" {
+		return a.Message
+	}
+	return fallback
 }
 
 // loadEvidence reads everything a port answer needs from the machine.
@@ -963,9 +1263,16 @@ func usage(w io.Writer) error {
 
 usage
   portwhy why <host:port> [flags]
+  portwhy wait <host:port> [flags]
   portwhy unix <path|@name> [flags]
   portwhy states
   portwhy version
+
+"wait" is the only command that keeps looking. Every round reads the tables and
+then makes one real plain bind(), and the only thing that ends the wait early is
+a bind() the kernel accepts. A deadline that passes is not a success: it exits 1
+or 3 with the last round's answer, because a script that treats a timeout as
+"the port is free now" starts a service that cannot bind.
 
 "unix" asks the other question this tool answers: a unix socket name is not a
 port. Two facts decide it — whether a socket in /proc/net/unix carries the name,
@@ -1012,6 +1319,19 @@ flags for "why"
   -proc ROOT       procfs root used to name holders and to name this process's
                    network namespace (default %s)
 
+flags for "wait"
+  -timeout D       how long to wait (default 30s). 0 means no deadline, and the
+                   report says so: a default that quietly becomes an infinite
+                   wait is discovered at the worst possible moment
+  -interval D      pause between rounds (default 500ms, minimum 50ms). Each round
+                   is a real bind(), so the floor is a limit on side effects
+  -proto SPEC      tcp or udp (default tcp). "both" is refused: two protocols,
+                   one deadline and one timeline could only describe one of them
+  -until-bindable  bindable only. The single condition this version waits for; any
+                   other value is a usage error rather than an ignored flag
+  -no-holders      skip the /proc/<pid>/fd walk on every round
+  -tables DIR, -sysctl DIR, -proc ROOT   same meaning as for "why"
+
 every report states its scope
   the first two lines name the network namespace the answer is about, because
   "nothing holds this port" is only ever true of one namespace. portwhy reads
@@ -1032,6 +1352,8 @@ example
   portwhy why :8080 -all
   portwhy why :8080 -probe
   portwhy why -batch < ports.txt
+  portwhy wait 127.0.0.1:8080 -timeout 60s
+  portwhy wait :8080 -interval 200ms -timeout 0
   portwhy unix /run/app.sock
   portwhy unix @my-service -json
   portwhy states
