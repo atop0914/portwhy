@@ -31,6 +31,7 @@ import (
 	"github.com/atop0914/portwhy/internal/sysctl"
 	"github.com/atop0914/portwhy/internal/verdict"
 	"github.com/atop0914/portwhy/internal/version"
+	"github.com/atop0914/portwhy/internal/wait"
 )
 
 // schemaVersion is the version of the document contract, not of the program.
@@ -131,6 +132,76 @@ type ownerJSON struct {
 type reasonJSON struct {
 	Code   string `json:"code"`
 	Detail string `json:"detail,omitempty"`
+}
+
+// waitReport is the answer to "did it become bindable, and if not, why did the
+// wait stop looking".
+//
+// It is a fourth document rather than a portReport with a timeline attached: the
+// port report answers about one instant, this one about an interval, and a shared
+// shape would have to leave half its fields empty in both uses. The names that
+// repeat (target, proto, kind, version, schema_version) repeat with the same type
+// and the same rule about absence.
+type waitReport struct {
+	SchemaVersion int    `json:"schema_version"`
+	Target        string `json:"target"`
+	Proto         string `json:"proto"`
+	Kind          string `json:"kind"`
+	// End is why the loop stopped: bound, timeout, or stopped. It is not inferred
+	// from kind, because a timeout can end on "taken" while a stop ends on
+	// "unknown" — and a consumer that only saw kind could not tell the two apart.
+	End string `json:"end"`
+	// Stop names the answer that made further waiting pointless. It is present only
+	// when end is "stopped": absence means the deadline ran out.
+	Stop string `json:"stop,omitempty"`
+	// Timeout is an object because zero milliseconds is a real deadline (bind
+	// immediately, once) while no deadline at all is not a number. `forever` is the
+	// switch; `ms` is null when it is set.
+	Timeout          waitTimeoutJSON `json:"timeout"`
+	IntervalMS       int64           `json:"interval_ms"`
+	WaitedMS         int64           `json:"waited_ms"`
+	Rounds           int             `json:"rounds"`
+	Attempts         int             `json:"attempts"`
+	UnreadableRounds int             `json:"unreadable_rounds"`
+	// Timeline is the first round, every round whose kind changed, and the round
+	// the wait ended on. It is not a log: identical rounds collapse, and a consumer
+	// that needs every round should count them, not read them.
+	Timeline []waitStepJSON `json:"timeline"`
+	// Note is the side-effect disclosure, in the same words the text output uses.
+	// It is a field rather than documentation because the effects are per round.
+	Note    string `json:"note"`
+	Version string `json:"version"`
+}
+
+// waitTimeoutJSON keeps "no deadline" out of the integer space.
+type waitTimeoutJSON struct {
+	Forever bool   `json:"forever"`
+	MS      *int64 `json:"ms"`
+}
+
+// waitStepJSON is one row of the timeline.
+type waitStepJSON struct {
+	Round int    `json:"round"`
+	AtMS  int64  `json:"at_ms"`
+	Kind  string `json:"kind"`
+	// TableKind is what the tables alone said. It is present even when it differs
+	// from kind, which is the whole point: a disagreement between two measurements
+	// is information, not noise to be reconciled silently.
+	TableKind string       `json:"table_kind"`
+	Note      string       `json:"note,omitempty"`
+	Stop      string       `json:"stop,omitempty"`
+	Bind      waitBindJSON `json:"bind"`
+}
+
+// waitBindJSON is the attempt behind one row. It repeats the fields of a probe
+// attempt on purpose: a consumer of this document must not have to know that the
+// other document spells them the same way.
+type waitBindJSON struct {
+	Outcome          string `json:"outcome"`
+	Errno            string `json:"errno,omitempty"`
+	Message          string `json:"message,omitempty"`
+	Error            string `json:"error,omitempty"`
+	UsableAsEvidence bool   `json:"usable_as_evidence"`
 }
 
 // batchError is the object for a line of a batch that never became a question.
@@ -532,10 +603,66 @@ func buildUnixReport(v verdict.UnixVerdict) unixReport {
 	return rep
 }
 
+// buildWaitReport turns the loop's result into the document.
+//
+// Nothing here recomputes an answer: every number is a count the loop made, and
+// every kind is the kind of the round it came from. A builder that recalculated
+// anything would be a second place for the rules to live.
+func buildWaitReport(res wait.Result, p waitParams) waitReport {
+	rep := waitReport{
+		SchemaVersion:    schemaVersion,
+		Target:           p.Addr.String(),
+		Proto:            p.Proto.String(),
+		Kind:             string(res.Kind),
+		End:              string(res.End),
+		Stop:             res.Stop,
+		IntervalMS:       p.Interval.Milliseconds(),
+		WaitedMS:         res.Waited.Milliseconds(),
+		Rounds:           res.Rounds,
+		Attempts:         res.Attempts,
+		UnreadableRounds: res.Unreadable,
+		Timeline:         make([]waitStepJSON, 0, len(res.Timeline)),
+		Note:             waitNote(),
+		Version:          version.Resolve().String(),
+	}
+	if p.Timeout > 0 {
+		ms := p.Timeout.Milliseconds()
+		rep.Timeout.MS = &ms
+	} else {
+		// No deadline is not a duration of zero: that would be a deadline that has
+		// already passed.
+		rep.Timeout.Forever = true
+	}
+	for _, r := range res.Timeline {
+		rep.Timeline = append(rep.Timeline, waitStepJSON{
+			Round:     r.Index,
+			AtMS:      r.At.Milliseconds(),
+			Kind:      string(r.Kind),
+			TableKind: string(r.TableKind),
+			Note:      r.Note,
+			Stop:      r.Stop,
+			Bind: waitBindJSON{
+				Outcome:          string(r.Bind.Outcome),
+				Errno:            r.Bind.Errno,
+				Message:          r.Bind.Message,
+				Error:            r.Bind.Err,
+				UsableAsEvidence: r.Bind.Trustworthy(),
+			},
+		})
+	}
+	return rep
+}
+
 // renderJSON and renderJSONBoth are the two entry points the CLI uses; they
 // exist so the call sites read as "render", not as "build then encode".
 func renderJSON(w io.Writer, v verdict.Verdict) error {
 	return encodeJSON(w, buildPortReport(v))
+}
+
+// renderWaitJSON is the wait document. It is a separate entry point because the
+// command has no verdict to hand it: a wait ends on a result, not on one answer.
+func renderWaitJSON(w io.Writer, res wait.Result, p waitParams) error {
+	return encodeJSON(w, buildWaitReport(res, p))
 }
 
 func renderJSONBoth(w io.Writer, tcp, udp verdict.Verdict) error {

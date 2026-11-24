@@ -1,8 +1,8 @@
 # JSON schema (schema_version 1)
 
-portwhy has three machine-readable documents: one answer for a port, one answer
-for a unix socket name, and one wrapper for `-proto both`. This file is the
-contract for all three, and it is enforced: `TestJSONSchemaDocumentMatchesTheTypes`
+portwhy has four machine-readable documents: one answer for a port, one answer
+for a unix socket name, one wrapper for `-proto both`, and one for `wait`. This
+file is the contract for all four, and it is enforced: `TestJSONSchemaDocumentMatchesTheTypes`
 walks the report types with reflection and compares them to the tables below in
 both directions. A field in the code that is missing here fails the build, and a
 field here that the code does not emit fails it too. The gate reads this file
@@ -48,6 +48,10 @@ per-line object (see below), because one bad line must not erase the others.
 `unknown` shares no code with `free` on purpose. A monitor that treats non-zero
 as "taken" would be wrong about `unknown`, and a monitor that treats it as
 "free" would be wrong in the dangerous direction.
+
+`wait` uses the same mapping, with one addition: it exits 0 only when `end` is
+`bound`. A deadline that passes exits 1 or 3 with the last round's kind, so
+"the wait finished" and "the port is free" are never the same fact in a script.
 
 ## Documents
 
@@ -171,6 +175,49 @@ UDP 53 taken while TCP 53 is free is the normal state of a DNS host, and a singl
 | `exit_from` | string | always | never absent; names the half the process exit code came from (`tcp`) |
 | `tcp` | object | always | never absent; a `portReport` |
 | `udp` | object | always | never absent; a `portReport` |
+
+### waitReport
+
+Printed by `portwhy wait <target> -json`. It answers about an interval, not an
+instant, and the difference shows in every field: `end` says how the loop stopped,
+`rounds` counts observations rather than measurements of the port, and `timeline`
+is the shape of the wait rather than a log.
+
+The one rule a consumer has to read carefully: `kind` is the answer the wait ended
+on, `end` is why it stopped. `end: "timeout"` with `kind: "listening"` is a port
+that never freed; `end: "bound"` is the only state in which `kind` is `free`. A
+consumer that treats `kind: "free"` as "safe to start the service" is reading the
+contract correctly only when `end` is `bound` — and `kind` is never `free` in any
+other case, which the tests assert over every combination.
+
+| field | type | when it appears | absence means |
+|---|---|---|---|
+| `schema_version` | integer | always | never absent |
+| `target` | string | always | never absent; the normalised `host:port` |
+| `proto` | string | always | never absent; `tcp` or `udp` (`both` is a usage error) |
+| `kind` | string | always | never absent; the last round's answer, `free` only when `end` is `bound` |
+| `end` | string | always | never absent; `bound`, `timeout` or `stopped` |
+| `stop` | string | only when `end` is `stopped` | absent means the deadline ran out; present names what waiting could not change (`not-permitted`, `addr-not-available`, `probe-failed`, `probe-not-run`, `probe-not-evidence`) |
+| `timeout.forever` | boolean | always | never absent; `true` when `-timeout 0` was given |
+| `timeout.ms` | integer\|null | only when a deadline was set | `null` means no deadline, which is not a duration of zero |
+| `interval_ms` | integer | always | never absent; the pause that was actually used |
+| `waited_ms` | integer | always | never absent; monotonic, from the first round to the one the wait ended on |
+| `rounds` | integer | always | never absent; observations made |
+| `attempts` | integer | always | never absent; rounds in which a `bind()` was really made, which is smaller than `rounds` when a socket could not be created |
+| `unreadable_rounds` | integer | always | never absent; rounds in which at least one table could not be read. `0` is a measurement |
+| `timeline[].round` | integer | one element per kept round | the array is never empty: it always has the first round and the round the wait ended on |
+| `timeline[].at_ms` | integer | always within an element | never absent; monotonic milliseconds since the first round |
+| `timeline[].kind` | string | always within an element | never absent; what that round supports once its bind is taken into account |
+| `timeline[].table_kind` | string | always within an element | never absent; what the tables alone said, kept so a disagreement is visible |
+| `timeline[].note` | string | only when the two disagreed | absent means the tables and the bind agreed |
+| `timeline[].stop` | string | only on the round that stopped the wait | absent means the round let the wait continue |
+| `timeline[].bind.outcome` | string | always within an element | never absent; `bound`, `addr-in-use`, `not-permitted`, `addr-not-available`, `failed` or `not-run` |
+| `timeline[].bind.errno` | string | only when the kernel named one | absent means no errno was involved (success, or a failed `socket()`) |
+| `timeline[].bind.message` | string | only when the kernel or Go produced one | absent means there was no message to quote |
+| `timeline[].bind.error` | string | only when the attempt itself is untrustworthy | absent means the attempt is evidence; a set error means it is not, whatever the outcome says |
+| `timeline[].bind.usable_as_evidence` | boolean | always within an element | never absent; false for `not-run` and for any attempt carrying an `error` |
+| `note` | string | always | never absent; the side-effect disclosure, in the words the text output uses |
+| `version` | string | always | never absent; the program, not evidence |
 
 ## Batch mode: NDJSON
 

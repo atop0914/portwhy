@@ -18,7 +18,7 @@ import (
 // schemaDocPath is relative to this package, which is where `go test` runs.
 const schemaDocPath = "../../docs/json-schema.md"
 
-// docRoots are the three documents the CLI can print. A root is not expanded
+// docRoots are the documents the CLI can print. A root is not expanded
 // inside another document (bothReport names its two halves), because each root
 // has its own section and a repeated expansion would report every port field
 // twice.
@@ -27,6 +27,7 @@ var docRoots = map[string]reflect.Type{
 	"unixReport": reflect.TypeOf(unixReport{}),
 	"bothReport": reflect.TypeOf(bothReport{}),
 	"batchError": reflect.TypeOf(batchError{}),
+	"waitReport": reflect.TypeOf(waitReport{}),
 }
 
 // schemaField is one path in one document, with the JSON type a consumer sees.

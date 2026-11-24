@@ -286,6 +286,7 @@ func runWait(args []string, stdout, stderr io.Writer) int {
 	timeout := fs.Duration("timeout", 30*time.Second, "deadline; 0 means no deadline")
 	interval := fs.Duration("interval", 500*time.Millisecond, "pause between attempts (minimum 50ms)")
 	until := fs.String("until-bindable", "bindable", "the only condition this version can wait for")
+	asJSON := fs.Bool("json", false, "emit a JSON report instead of text")
 	tableDir := fs.String("tables", procnet.DefaultDir, "directory holding the kernel socket tables")
 	sysctlDir := fs.String("sysctl", sysctl.DefaultDir, "directory holding the kernel tunables")
 	procRoot := fs.String("proc", sockid.DefaultRoot, "procfs root used to name the holder")
@@ -368,8 +369,14 @@ func runWait(args []string, stdout, stderr io.Writer) int {
 	res := wait.Run(wait.Options{Timeout: *timeout, Interval: *interval}, observe)
 
 	params := waitParams{Addr: addr, Proto: p, Timeout: *timeout, Interval: *interval}
-	if err := renderWaitText(stdout, res, last, params); err != nil {
-		_ = fprintf(stderr, "portwhy: writing report: %v\n", err)
+	var renderErr error
+	if *asJSON {
+		renderErr = renderWaitJSON(stdout, res, params)
+	} else {
+		renderErr = renderWaitText(stdout, res, last, params)
+	}
+	if renderErr != nil {
+		_ = fprintf(stderr, "portwhy: writing report: %v\n", renderErr)
 		return exitUsage
 	}
 	if res.End == wait.EndBound {
@@ -490,11 +497,34 @@ func renderWaitText(w io.Writer, res wait.Result, last verdict.Verdict, p waitPa
 		}
 	}
 
-	return fprintf(w, "\nnote\n"+
-		"  every round is a real bind(): listen() is never called and the socket is closed at\n"+
-		"  once. A refused bind changes nothing; the one that is accepted holds the address for\n"+
-		"  the length of a single syscall. Each round is true of its own instant — the port can\n"+
-		"  be taken again the moment the attempt returns.\n")
+	return writeWaitNote(w)
+}
+
+// waitNoteLines is the side-effect disclosure, one sentence per line pair.
+//
+// It is written once and joined for JSON, so the two formats cannot drift into
+// telling a reader different things about what the command just did to their
+// machine.
+var waitNoteLines = []string{
+	"every round is a real bind(): listen() is never called and the socket is closed at",
+	"once. A refused bind changes nothing; the one that is accepted holds the address for",
+	"the length of a single syscall. Each round is true of its own instant — the port can",
+	"be taken again the moment the attempt returns.",
+}
+
+// waitNote is the same disclosure as one line, for the machine-readable report.
+func waitNote() string { return strings.Join(waitNoteLines, " ") }
+
+func writeWaitNote(w io.Writer) error {
+	if err := fprintf(w, "\nnote\n"); err != nil {
+		return err
+	}
+	for _, line := range waitNoteLines {
+		if err := fprintf(w, "  %s\n", line); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // renderWaitStop explains an end that no amount of waiting would have changed.

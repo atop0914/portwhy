@@ -3,6 +3,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -247,5 +248,130 @@ func TestWaitExplainsWhyBothProtocolsAreRefused(t *testing.T) {
 	_, _, errb := runCLI(t, "wait", "127.0.0.1:9", "-proto", "both")
 	if !strings.Contains(errb, "independent") || !strings.Contains(errb, "one timeline") {
 		t.Errorf("the refusal does not explain the two namespaces and the one timeline:\n%s", errb)
+	}
+}
+
+// waitDoc is the shape this test reads. It is written out here rather than
+// reusing waitReport so that a field renamed in the code is caught by the parse
+// failing, not by the same struct agreeing with itself.
+type waitDoc struct {
+	SchemaVersion int    `json:"schema_version"`
+	Target        string `json:"target"`
+	Proto         string `json:"proto"`
+	Kind          string `json:"kind"`
+	End           string `json:"end"`
+	Stop          string `json:"stop"`
+	Timeout       struct {
+		Forever bool   `json:"forever"`
+		MS      *int64 `json:"ms"`
+	} `json:"timeout"`
+	IntervalMS       int64 `json:"interval_ms"`
+	WaitedMS         int64 `json:"waited_ms"`
+	Rounds           int   `json:"rounds"`
+	Attempts         int   `json:"attempts"`
+	UnreadableRounds int   `json:"unreadable_rounds"`
+	Timeline         []struct {
+		Round     int    `json:"round"`
+		AtMS      int64  `json:"at_ms"`
+		Kind      string `json:"kind"`
+		TableKind string `json:"table_kind"`
+		Note      string `json:"note"`
+		Stop      string `json:"stop"`
+		Bind      struct {
+			Outcome          string `json:"outcome"`
+			Errno            string `json:"errno"`
+			Message          string `json:"message"`
+			Error            string `json:"error"`
+			UsableAsEvidence bool   `json:"usable_as_evidence"`
+		} `json:"bind"`
+	} `json:"timeline"`
+	Note    string `json:"note"`
+	Version string `json:"version"`
+}
+
+func TestWaitJSONCarriesTheTimelineAndTheDisclosure(t *testing.T) {
+	addr, release := listenOn(t)
+	defer release()
+
+	code, out, errb := runCLI(t, "wait", addr, "-timeout", "150ms", "-interval", "50ms", "-json")
+	if code != exitTaken {
+		t.Fatalf("exit = %d, want %d (stderr: %s)\n%s", code, exitTaken, errb, out)
+	}
+	var doc waitDoc
+	if err := json.Unmarshal([]byte(out), &doc); err != nil {
+		t.Fatalf("output is not one JSON document: %v\n%s", err, out)
+	}
+
+	if doc.SchemaVersion != 1 {
+		t.Errorf("schema_version = %d, want 1", doc.SchemaVersion)
+	}
+	if doc.Target != addr || doc.Proto != "tcp" {
+		t.Errorf("target/proto = %s/%s, want %s/tcp", doc.Target, doc.Proto, addr)
+	}
+	if doc.End != "timeout" || doc.Kind != "listening" {
+		t.Errorf("end/kind = %s/%s, want timeout/listening", doc.End, doc.Kind)
+	}
+	if doc.Stop != "" {
+		t.Errorf("stop = %q, want empty: nothing stopped this wait but the deadline", doc.Stop)
+	}
+	if doc.Timeout.Forever || doc.Timeout.MS == nil || *doc.Timeout.MS != 150 {
+		t.Errorf("timeout = %+v, want a 150ms deadline", doc.Timeout)
+	}
+	if doc.IntervalMS != 50 {
+		t.Errorf("interval_ms = %d, want 50", doc.IntervalMS)
+	}
+	if doc.WaitedMS < 150 || doc.WaitedMS > 2000 {
+		t.Errorf("waited_ms = %d, want at least the deadline and not wildly more", doc.WaitedMS)
+	}
+	if doc.Rounds < 2 || doc.Attempts != doc.Rounds {
+		t.Errorf("rounds = %d, attempts = %d: every round made one bind", doc.Rounds, doc.Attempts)
+	}
+	if doc.UnreadableRounds != 0 {
+		t.Errorf("unreadable_rounds = %d, want 0: the tables were readable", doc.UnreadableRounds)
+	}
+	if len(doc.Timeline) != 2 {
+		t.Fatalf("timeline = %d rows, want 2 (first and final)\n%s", len(doc.Timeline), out)
+	}
+	first, final := doc.Timeline[0], doc.Timeline[1]
+	if first.Round != 1 || first.Kind != "listening" || first.TableKind != "listening" {
+		t.Errorf("first row = %+v, want round 1 listening/listening", first)
+	}
+	if first.Bind.Outcome != "addr-in-use" || first.Bind.Errno != "EADDRINUSE" || !first.Bind.UsableAsEvidence {
+		t.Errorf("first bind = %+v, want a usable EADDRINUSE", first.Bind)
+	}
+	if final.AtMS < 150 {
+		t.Errorf("final row at %dms, want the deadline", final.AtMS)
+	}
+	if !strings.Contains(doc.Note, "listen() is never called") {
+		t.Errorf("note does not disclose the side effect: %q", doc.Note)
+	}
+	if doc.Version == "" {
+		t.Error("version is empty")
+	}
+}
+
+// `-timeout 0` is a real choice, and the document has to be able to say it: null
+// milliseconds with forever set, not zero milliseconds, which would be a deadline
+// that has already passed.
+func TestWaitJSONSpellsNoDeadlineAsNoNumber(t *testing.T) {
+	port := freePort(t)
+	target := fmt.Sprintf("127.0.0.1:%d", port)
+
+	code, out, errb := runCLI(t, "wait", target, "-timeout", "0s", "-interval", "50ms", "-json")
+	if code != exitFree {
+		t.Fatalf("exit = %d, want %d (stderr: %s)\n%s", code, exitFree, errb, out)
+	}
+	var doc waitDoc
+	if err := json.Unmarshal([]byte(out), &doc); err != nil {
+		t.Fatalf("output is not one JSON document: %v\n%s", err, out)
+	}
+	if !doc.Timeout.Forever {
+		t.Error("timeout.forever is false: the deadline was not a duration")
+	}
+	if doc.Timeout.MS != nil {
+		t.Errorf("timeout.ms = %d, want null: no deadline is not zero milliseconds", *doc.Timeout.MS)
+	}
+	if doc.End != "bound" || doc.Kind != "free" {
+		t.Errorf("end/kind = %s/%s, want bound/free", doc.End, doc.Kind)
 	}
 }
