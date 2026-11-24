@@ -129,8 +129,8 @@ func TestJudgeNeverInventsFreeWithoutAnAcceptedBind(t *testing.T) {
 					r.TableKind, c.table)
 			}
 			// The invariant, restated as an assertion rather than trusted to the
-			// branch table above.
-			if r.Kind == verdict.KindFree && !(c.bind.Outcome == probe.OutcomeBound && c.bind.Trustworthy()) {
+			// branch table above: free needs an accepted, trustworthy attempt.
+			if r.Kind == verdict.KindFree && (c.bind.Outcome != probe.OutcomeBound || !c.bind.Trustworthy()) {
 				t.Errorf("free without an accepted bind: outcome %s, err %q", c.bind.Outcome, c.bind.Err)
 			}
 		})

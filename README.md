@@ -275,6 +275,76 @@ exit code: 0, from the tcp answer; the udp answer alone would exit 1
 A merged answer would tell the UDP user "free" and the TCP user "taken", so the
 two are printed and the one the exit code came from is named in the report.
 
+## Waiting, and what a deadline may not say
+
+The answer to "why can't I bind" is usually followed by "then tell me when I can".
+The usual script is `while ! nc -z host 8080; do sleep 1; done`, which asks whether
+a connection is accepted — a different question, and the wrong one on a port held
+by a UDP socket or by a socket bound without `listen()`.
+
+`portwhy wait` asks the only question that matters: it makes a plain `bind()` over
+and over until the kernel accepts one, and says how the interval went.
+
+```
+$ portwhy wait 127.0.0.1:8080 -timeout 300ms -interval 50ms
+portwhy wait 127.0.0.1:8080/tcp
+  timeout 300ms, interval 50ms; the only thing that ends this is a plain bind() the kernel accepts
+
+timeline
+  t+0.001s   round 1    listening
+  t+0.302s   round 7    listening
+
+result
+  not bindable at the deadline: the last round still answered "listening"
+    a listening socket holds it — 7 attempt(s), none accepted, 302ms waited
+
+still held by, as of the last round
+  LISTEN         127.0.0.1:8080         pid 85 (python3) fd 3 [sole] inode 53482830
+
+limits
+  - holder lookup walked 3 process(es), 0 not readable
+
+note
+  every round is a real bind(): listen() is never called and the socket is closed at
+  once. A refused bind changes nothing; the one that is accepted holds the address for
+  the length of a single syscall. Each round is true of its own instant — the port can
+  be taken again the moment the attempt returns.
+```
+
+The exit code is 1, and the report never uses the word "success" for that. When the
+holder lets go, the same command ends differently:
+
+```
+$ portwhy wait 127.0.0.1:8080 -timeout 5s
+timeline
+  t+0.002s   round 1    listening
+  t+0.206s   round 3    free (changed from listening)
+
+result
+  bindable: a plain bind() was accepted at t+0.206s, after 3 attempt(s) in 206ms
+```
+
+Four decisions are worth stating, because each one is a way the command could have
+been more convenient and less honest:
+
+- **A deadline is not a port.** A timeout exits 1 (or 3) with the last round's
+  answer. There is no "assume it freed" path, because the script that believed it
+  would go on to start a service that cannot bind.
+- **The bind is plain.** `SO_REUSEADDR` would be accepted on a `TIME_WAIT`
+  reservation, and reporting that as "you can bind now" would be false for the
+  plain bind the caller is about to make.
+- **Every round reads the tables again**, and a round that could not read them is
+  `unknown`, never `free`. The count of blind rounds is part of the conclusion:
+  "it never freed in 30s" reads very differently when half the rounds were blind.
+- **EACCES and EADDRNOTAVAIL stop the wait.** A capability boundary and an address
+  that is not on this host are answers, not delays, and waiting for either is
+  waiting for a moment that will not arrive.
+
+`-proto both` is refused: a TCP bind and a UDP bind are independent namespaces, and
+one deadline and one timeline could only describe one of them. `-interval` below
+50ms is refused as well — every round is a real `bind()`, so the floor is a limit on
+side effects rather than politeness about CPU.
+
 ## The name in the way with nobody behind it
 
 A unix socket is not a port and has no protocol to be shared in. It is a name,
@@ -429,6 +499,7 @@ Zero third-party dependencies, no cgo. Linux only: the whole answer comes from
 
 ```
 portwhy why <host:port> [flags]
+portwhy wait <host:port> [flags]
 portwhy unix <path|@name> [flags]
 portwhy states
 portwhy version
@@ -447,6 +518,18 @@ portwhy version
 | `-proc ROOT` | use ROOT instead of `/proc` when naming the holder and when naming this process's network namespace |
 
 `:8080` means every interface (`0.0.0.0:8080`). `[::1]:8080` is IPv6.
+
+`portwhy wait` has its own flags, because a loop has questions a single answer does
+not:
+
+| flag | meaning |
+|---|---|
+| `-timeout D` | deadline (default `30s`). `0` means no deadline, and the report says so in words: a default that quietly becomes an infinite wait is discovered at the worst moment |
+| `-interval D` | pause between rounds (default `500ms`, minimum `50ms`). Every round is a real `bind()` |
+| `-proto tcp\|udp` | which namespace to wait on (default `tcp`). `both` is a usage error: two answers, one deadline and one timeline could only describe one of them |
+| `-until-bindable` | `bindable` only — the one condition this version waits for. Another value is a usage error rather than an ignored flag |
+| `-json` | the `waitReport` document |
+| `-no-holders`, `-tables DIR`, `-sysctl DIR`, `-proc ROOT` | same meaning as for `why`, applied on every round |
 
 `portwhy unix` takes its own smaller flag set — `-json`, `-tables DIR`, `-proc ROOT`,
 `-no-holders` — because none of the port questions apply: there is no ephemeral
@@ -475,6 +558,11 @@ A script that treats every non-zero code as "taken" will do the wrong thing on
 With `--probe`, a 0 can become a 3: the tables said nothing held the address and
 a `bind()` proved otherwise. The other direction never happens — no flag turns a
 3 into a 0.
+
+`wait` uses the same four codes with one extra rule: **0 means a plain `bind()` was
+accepted during the wait, not that the waiting finished.** A deadline that passes
+exits 1 or 3 with the last round's answer, and `-json` reports `end: "timeout"` so
+a consumer can tell "it never freed" from "I never found out".
 
 ### JSON output and the batch stream
 
@@ -571,6 +659,11 @@ Written down because the boundary is the product:
   needs a dependency this project does not take.
 - **It does not kill anything.** No `--force`, no `--kill`, on purpose: a port
   diagnostic is the wrong place to hide a destructive action.
+- **`wait` does not promise the port afterwards.** A successful wait reports the
+  instant a `bind()` was accepted and closes its socket immediately; anyone may
+  take the port a microsecond later. It also refuses `-proto both` and any batch
+  form, because two answers sharing one deadline and one timeline can only describe
+  one of them, and it never keeps waiting through `EACCES` or `EADDRNOTAVAIL`.
 - **It does not run on macOS or Windows.** `portwhy` exits with an explicit
   "socket tables are only available on Linux" rather than printing an empty
   report, and `portwhy unix` does the same for `/proc/net/unix`. The binary

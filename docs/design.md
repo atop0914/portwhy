@@ -127,6 +127,39 @@ Nothing enters the `free` column from any row that was not already `free`. That 
 what keeps the probe from becoming a second opinion that can be talked into a
 reassuring answer.
 
+### Waiting: the only success is an accepted bind
+
+`wait` is that probe in a loop, so it inherits the direction rule — and needs a
+second one, because a loop also decides *when to stop*. A loop that stops at the
+wrong time is a wrong answer that arrives late, which is worse than a wrong answer
+that arrives at once: the script has already moved on.
+
+| tables said | the round's plain bind | that round's answer | what the loop does |
+|---|---|---|---|
+| anything | accepted | `free` | stops: this is the only success there is |
+| `free` | refused `EADDRINUSE` | `unknown` | keeps waiting — bind-without-listen, the tables cannot see it and one `bind()` can |
+| `unknown` (a table could not be read) | refused `EADDRINUSE` | `unknown` | keeps waiting; the round is counted as blind |
+| `listening`, `bound`, `time-wait-only`, `occupied` | refused `EADDRINUSE` | that answer | keeps waiting; the tables explain the refusal |
+| any | `EACCES` / `EPERM` | `unknown` | stops: a capability boundary does not move with time |
+| any | `EADDRNOTAVAIL` | `unknown` | stops: the address is not on this host |
+| any | not run, or a failed `close()` | `unknown` | stops: no evidence, or this process may be holding the port itself |
+
+Three consequences follow, and all three are tests rather than intentions:
+
+- **A deadline is not an answer.** The timeout branch reports the last round's kind,
+  so it exits 1 or 3 and never 0. The success sentence exists in exactly one place
+  in the renderer, and only the `bound` end reaches it.
+- **A blind round is not a free round.** The tables are read again on every round —
+  reusing the first read would make one instant's evidence describe a whole
+  timeline — and the number of blind rounds goes into the conclusion. The one case
+  where a blind wait still exits 0 is a bind the kernel really accepted: that is a
+  measurement no unreadable table can overrule, and the report says the diagnosis
+  behind it was blind instead of pretending it was not.
+- **The interval has a floor.** Each round is a real `bind()`, so `-interval 50ms`
+  is a limit on side effects, not a CPU preference. Below it the command is a usage
+  error rather than a clamped value: a flag that silently does something other than
+  what it was given is the same class of lie as a timeout that reports success.
+
 ### The IPv6 wildcard: one tunable, three answers
 
 Day 1 answered this shape with `unknown` and said why: whether `[::]` also holds an
@@ -391,6 +424,14 @@ Each of these is a test today, and each is a way the tool could become harmful:
 - A `TIME_WAIT` row must not be reported as a listener: the fixes differ.
 - A `TIME_WAIT` row must never be given an owner.
 - An unreadable table must produce exit 3, never exit 0.
+- A wait that reaches its deadline must not report success: exit 1 or 3, the last
+  round's kind, and no sentence that says a bind was accepted.
+- A wait must not keep waiting after `EACCES` or `EADDRNOTAVAIL`: neither is a busy
+  port, and neither changes because time passed.
+- A wait whose rounds were blind must say how many were blind, and must end
+  `unknown` unless a plain bind was actually accepted.
+- A successful wait must not claim the port afterwards: it reports the instant, not
+  a reservation.
 - A `[::]` listener on the port must produce `unknown`, never `free`, when
   `bindv6only` could not be read. With `bindv6only=1` the same row must not be a
   holder at all; with `0` it must be one — and in both cases the measured value and
@@ -537,6 +578,13 @@ count. The same treatment applies to the unix table (`{read, present, error}`,
 because a kernel without `/proc/net/unix` and a procfs this process may not open
 are different worlds) and to `tables_unreadable[]` (`{name, present, error}`).
 `version` sits outside `evidence` on purpose: it is not evidence about a port.
+
+**The fourth document made "no deadline" a shape, not a number.** `waitReport` has
+a `timeout` object — `{forever, ms}`, with `ms` null when `forever` is set — because
+zero milliseconds is a real deadline (look once, then give up) while "no deadline"
+is not a duration at all. The same report keeps `end` and `kind` apart: a timeout
+can end on `taken`, a stop ends on `unknown`, and a consumer that only read `kind`
+could not tell "it never freed" from "I never found out".
 
 **The document is checked, not trusted.** `TestJSONSchemaDocumentMatchesTheTypes`
 walks the types with reflection and compares them to the tables in
