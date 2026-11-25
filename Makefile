@@ -47,6 +47,19 @@ test-noskip:
 race:
 	$(GO) test -count=1 -race -timeout 300s ./...
 
+# A fuzz run finds inputs by chance, so a green run says nothing about what it did
+# not try — which is why this is not part of `ci`. The deterministic part is the
+# corpus: every file under internal/procnet/testdata/fuzz/<Target>/ is replayed by
+# an ordinary `go test`, so an input the fuzzer once found cannot come back without
+# the suite going red. When a run does fail, commit the file it wrote.
+FUZZTIME ?= 10s
+.PHONY: fuzz
+fuzz:
+	@for t in FuzzParse FuzzDecodeAddr; do \
+		echo "--- procnet/$$t $(FUZZTIME)"; \
+		$(GO) test -run=^$$ -fuzz=^$$t$$ -fuzztime=$(FUZZTIME) ./internal/procnet/ || exit 1; \
+	done
+
 .PHONY: build
 build:
 	@mkdir -p bin
