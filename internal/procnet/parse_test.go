@@ -166,6 +166,63 @@ func TestParseUnknownStateIsNamedNotRejected(t *testing.T) {
 	}
 }
 
+// Day 8 left this open on purpose: columns are taken by position and the rest are
+// ignored, so that a kernel which adds a column cannot break the parser. The other
+// half of that trade is a line carrying two rows — the first half parses, the
+// second half disappears, and the port on it answers "free". Two 17-field rows
+// glued together are 34 fields, which is what a lost newline looks like in a
+// truncated capture or a concatenated file.
+func TestParseRejectsTwoRowsOnOneLine(t *testing.T) {
+	first := testRow(t, Addr{IP: netip.MustParseAddr("127.0.0.1"), Port: 8080}, Addr{IP: netip.AddrFrom4([4]byte{}), Port: 0}, StateListen, 11)
+	second := testRow(t, Addr{IP: netip.MustParseAddr("127.0.0.1"), Port: 8081}, Addr{IP: netip.AddrFrom4([4]byte{}), Port: 0}, StateListen, 12)
+
+	socks, err := Parse("tcp", TCP, V4, strings.NewReader(headerTCP+"\n"+first+second+"\n"))
+	if err == nil {
+		t.Fatalf("two rows on one line were accepted as %d socket(s); port 8081 would answer free", len(socks))
+	}
+	if socks != nil {
+		t.Errorf("a failed parse returned %d rows alongside the error", len(socks))
+	}
+	var pe *ParseError
+	if !errors.As(err, &pe) {
+		t.Fatalf("err = %T (%v), want *ParseError", err, err)
+	}
+	if pe.Line != 2 {
+		t.Errorf("line = %d, want 2", pe.Line)
+	}
+	if want := "two rows"; !strings.Contains(pe.Err.Error(), want) {
+		t.Errorf("error %q does not say what the shape was (%q)", pe.Err, want)
+	}
+}
+
+// The other side of the same constant, and the reason the ceiling is a count
+// rather than "must be exactly 17": a kernel that adds a column, or three, must
+// still parse. Without this, maxFields could be 17 and the glued-row test above
+// would stay green while the tool broke on the next kernel.
+func TestParseAcceptsAFewExtraColumns(t *testing.T) {
+	row := testRow(t, Addr{IP: netip.MustParseAddr("127.0.0.1"), Port: 8080}, Addr{IP: netip.AddrFrom4([4]byte{}), Port: 0}, StateListen, 21)
+	for _, extra := range []int{1, 2, 3} {
+		padded := row + strings.Repeat(" 0", extra)
+		if got := len(strings.Fields(padded)); got != 17+extra {
+			t.Fatalf("fixture has %d fields, want %d", got, 17+extra)
+		}
+		socks, err := Parse("tcp", TCP, V4, strings.NewReader(headerTCP+"\n"+padded+"\n"))
+		if err != nil {
+			t.Errorf("%d extra column(s) were rejected: %v", extra, err)
+			continue
+		}
+		if len(socks) != 1 || socks[0].Local.Port != 8080 {
+			t.Errorf("%d extra column(s) parsed as %d rows, port %v", extra, len(socks), socks)
+		}
+	}
+
+	// One more than the ceiling is not a column.
+	over := row + strings.Repeat(" 0", maxFields-17+1)
+	if _, err := Parse("tcp", TCP, V4, strings.NewReader(headerTCP+"\n"+over+"\n")); err == nil {
+		t.Errorf("%d fields were accepted, want a rejection past %d", len(strings.Fields(over)), maxFields)
+	}
+}
+
 func TestAddrIsWildcard(t *testing.T) {
 	cases := []struct {
 		addr netip.Addr

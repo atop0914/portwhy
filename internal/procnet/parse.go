@@ -215,12 +215,25 @@ const (
 	fieldUID   = 7
 	fieldInode = 9
 	minFields  = fieldInode + 1
+
+	// maxFields is where a line stops being a line. A tcp row has 17 columns on
+	// 6.x and had 15 on older kernels, so 20 is three columns of headroom; a
+	// future kernel adds columns one at a time, never seventeen at once. A line
+	// carrying two rows' worth of fields is not a newer kernel, it is a lost
+	// newline — a truncated capture, a concatenated file, a hand-written
+	// fixture — and accepting it would answer for the first row while silently
+	// dropping the second, whose port would then look free. Rejecting the line
+	// costs a table and yields unknown; accepting it yields a confident lie.
+	maxFields = 2 * minFields
 )
 
 func parseRow(name string, proto Proto, family Family, text string) (Socket, error) {
 	f := strings.Fields(text)
 	if len(f) < minFields {
 		return Socket{}, fmt.Errorf("want at least %d fields, got %d", minFields, len(f))
+	}
+	if len(f) > maxFields {
+		return Socket{}, fmt.Errorf("want at most %d fields, got %d (two rows on one line?)", maxFields, len(f))
 	}
 
 	local, err := parseHexAddr(f[fieldLocal], family)

@@ -161,6 +161,32 @@ func TestInjectedIPv6WildcardIsARealShadow(t *testing.T) {
 	}
 }
 
+// The column ceiling is only worth having if it survives to the top: a table
+// whose line carries two rows must fail as a table rather than answer for the
+// first half. The port on the second half is the one a "free" would be wrong
+// about, so that is the port the test asks about.
+func TestGluedRowTableIsUnknownNotFree(t *testing.T) {
+	glued := row(v4Loopback, 8080, "0A", 601) + row(v4Loopback, 8081, "0A", 602)
+	dir := tablesDir(t, map[string]string{"tcp": headerTCP + "\n" + glued})
+
+	code, out, errb := runCLI(t, "why", "127.0.0.1:8081", "-json", "-tables", dir, "-no-holders")
+	if code != exitUnknown {
+		t.Fatalf("exit = %d, want %d (stderr: %s)\n%s", code, exitUnknown, errb, out)
+	}
+	var rep struct {
+		Kind string `json:"kind"`
+	}
+	if err := json.Unmarshal([]byte(out), &rep); err != nil {
+		t.Fatalf("not JSON: %v\n%s", err, out)
+	}
+	if rep.Kind != "unknown" {
+		t.Errorf("kind = %q, want unknown", rep.Kind)
+	}
+	if strings.Contains(out, `"free"`) {
+		t.Errorf("a table that could not be parsed produced a free answer:\n%s", out)
+	}
+}
+
 // Every row on the port gets a machine-readable reason. A user greps these; prose
 // in that column would be unusable in a script.
 func TestAllRowsCarryTheirMatchCode(t *testing.T) {
