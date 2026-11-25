@@ -41,8 +41,8 @@ func batchLines(t *testing.T, out string) []map[string]any {
 func TestBatchAnswersEveryLineAndExitsWithTheWorst(t *testing.T) {
 	dir := tablesDir(t, map[string]string{
 		"tcp": headerTCP + "\n" +
-			row("0100007F", 9001, "0A", 111) + "\n" +
-			row("0100007F", 9003, "3F", 112) + "\n",
+			row(v4Loopback, 9001, "0A", 111) + "\n" +
+			row(v4Loopback, 9003, "3F", 112) + "\n",
 	})
 	stdin := "127.0.0.1:9000\n127.0.0.1:9001\n127.0.0.1:9003\n"
 	code, out, errb := runCLIStdin(t, stdin, "why", "-batch", "-tables", dir, "-no-holders")
@@ -80,7 +80,7 @@ func TestBatchAnswersEveryLineAndExitsWithTheWorst(t *testing.T) {
 // A line that is not a target answers for itself and nothing else.
 func TestBatchBadLineDoesNotDisturbTheOthers(t *testing.T) {
 	dir := tablesDir(t, map[string]string{
-		"tcp": headerTCP + "\n" + row("0100007F", 9001, "0A", 111),
+		"tcp": headerTCP + "\n" + row(v4Loopback, 9001, "0A", 111),
 	})
 	// A blank line in the middle is not a target and not an error.
 	stdin := "127.0.0.1:9000\nnonsense\n\n127.0.0.1:9001\n"
@@ -202,7 +202,7 @@ func (s *writeSpy) Write(p []byte) (int, error) {
 func TestBatchBothKeepsTwoAnswersAndTheTCPExitCode(t *testing.T) {
 	dir := tablesDir(t, map[string]string{
 		"tcp": headerTCP + "\n",
-		"udp": headerTCP + "\n" + row("0100007F", 5353, "07", 201),
+		"udp": headerTCP + "\n" + row(v4Loopback, 5353, "07", 201),
 	})
 	code, out, errb := runCLIStdin(t, "127.0.0.1:5353\n", "why", "-batch", "-proto", "both", "-tables", dir, "-no-holders")
 	if code != exitFree {

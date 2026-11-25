@@ -14,7 +14,7 @@ import (
 func TestBothPrintsTwoIndependentAnswers(t *testing.T) {
 	dir := tablesDir(t, map[string]string{
 		"tcp": headerTCP + "\n",
-		"udp": headerTCP + "\n" + row("0100007F", 5353, "07", 201),
+		"udp": headerTCP + "\n" + row(v4Loopback, 5353, "07", 201),
 	})
 	code, out, errb := runCLI(t, "why", "127.0.0.1:5353", "-proto", "both", "-tables", dir, "-no-holders")
 	// tcp is free, so the contract's code is 0 — and the report has to say the
@@ -42,7 +42,7 @@ func TestBothPrintsTwoIndependentAnswers(t *testing.T) {
 // swallowed by the tcp verdict.
 func TestBothWithTakenTCPReportsFreeUDP(t *testing.T) {
 	dir := tablesDir(t, map[string]string{
-		"tcp": headerTCP + "\n" + row("0100007F", 8080, "0A", 301),
+		"tcp": headerTCP + "\n" + row(v4Loopback, 8080, "0A", 301),
 		"udp": headerTCP + "\n",
 	})
 	code, out, errb := runCLI(t, "why", "127.0.0.1:8080", "-proto", "both", "-tables", dir, "-no-holders")
@@ -61,8 +61,8 @@ func TestBothWithTakenTCPReportsFreeUDP(t *testing.T) {
 // of findings would leave a consumer unable to tell which row answered which.
 func TestBothJSONKeepsReportsApart(t *testing.T) {
 	dir := tablesDir(t, map[string]string{
-		"tcp": headerTCP + "\n" + row("0100007F", 5353, "0A", 401),
-		"udp": headerTCP + "\n" + row("0100007F", 5353, "07", 402),
+		"tcp": headerTCP + "\n" + row(v4Loopback, 5353, "0A", 401),
+		"udp": headerTCP + "\n" + row(v4Loopback, 5353, "07", 402),
 	})
 	code, out, errb := runCLI(t, "why", "127.0.0.1:5353", "-proto", "both", "-json", "-tables", dir, "-no-holders")
 	if code != exitTaken {
@@ -146,8 +146,8 @@ func TestUnknownProtoIsUsageError(t *testing.T) {
 // would be the same leak as a udp row moving a tcp answer.
 func TestBothWithAllKeepsEachVerdictOnItsOwnRows(t *testing.T) {
 	dir := tablesDir(t, map[string]string{
-		"tcp": headerTCP + "\n" + row("0100007F", 5353, "0A", 501) + "\n" + row("0100007F", 9999, "0A", 502),
-		"udp": headerTCP + "\n" + row("0100007F", 5353, "07", 503),
+		"tcp": headerTCP + "\n" + row(v4Loopback, 5353, "0A", 501) + "\n" + row(v4Loopback, 9999, "0A", 502),
+		"udp": headerTCP + "\n" + row(v4Loopback, 5353, "07", 503),
 	})
 	code, out, errb := runCLI(t, "why", "127.0.0.1:5353", "-proto", "both", "-all", "-json",
 		"-tables", dir, "-no-holders")

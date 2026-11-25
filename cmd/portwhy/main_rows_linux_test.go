@@ -6,25 +6,53 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/atop0914/portwhy/internal/procnet"
 )
 
-// row renders one /proc/net/tcp line with no peer. Addresses are the kernel's
-// little-endian hex, so 127.0.0.1 is 0100007F and 10.1.2.3 is 0302010A.
-func row(localHex string, port uint16, state string, inode int) string {
-	return rowPeer(localHex, port, "00000000", 0, state, inode)
+// The addresses the fixtures below bind to, spelled once so a test case reads as
+// an address rather than as a byte order. The hex column is produced by
+// procnet.FormatAddr, the same encoder the parser is tested against: a fixture
+// written by hand can encode a layout nobody ever checks.
+var (
+	v4Loopback = netip.MustParseAddr("127.0.0.1")
+	v4Other    = netip.MustParseAddr("10.1.2.3")
+	v6Any      = netip.IPv6Unspecified()
+)
+
+// row renders one /proc/net/tcp line with no peer. The peer of a listener is the
+// wildcard of the same family, which is why it is derived here and not passed in.
+func row(local netip.Addr, port uint16, state string, inode int) string {
+	remote := netip.AddrFrom4([4]byte{})
+	if local.Is6() {
+		remote = netip.IPv6Unspecified()
+	}
+	return rowPeer(local, port, remote, 0, state, inode)
 }
 
 // rowPeer renders a row with a peer, which is how a connection is spelled. Used
 // for the "--all includes the far end of a connection" case.
-func rowPeer(localHex string, localPort uint16, remoteHex string, remotePort uint16, state string, inode int) string {
+func rowPeer(local netip.Addr, localPort uint16, remote netip.Addr, remotePort uint16, state string, inode int) string {
 	return fmt.Sprintf(
-		"   0: %s:%04X %s:%04X %s 00000000:00000000 00:00000000 00000000     0        0 %d 1 0000000000000000 100 0 0 10 0",
-		localHex, localPort, remoteHex, remotePort, state, inode)
+		"   0: %s %s %s 00000000:00000000 00:00000000 00000000     0        0 %d 1 0000000000000000 100 0 0 10 0",
+		hexField(local, localPort), hexField(remote, remotePort), state, inode)
+}
+
+// hexField is the kernel's spelling of an endpoint. A panic here is a broken
+// fixture, which must not degrade into a row that fails to parse and makes a test
+// pass for the wrong reason.
+func hexField(ip netip.Addr, port uint16) string {
+	s, err := procnet.FormatAddr(procnet.Addr{IP: ip, Port: port})
+	if err != nil {
+		panic(fmt.Sprintf("fixture address %v port %d: %v", ip, port, err))
+	}
+	return s
 }
 
 // rawKindLine returns the JSON line carrying "kind", so two runs can be compared
@@ -55,30 +83,30 @@ type allReport struct {
 func TestAllFlagNeverChangesTheAnswer(t *testing.T) {
 	cases := map[string]map[string]string{
 		"listener on the address": {
-			"tcp": headerTCP + "\n" + row("0100007F", 8080, "0A", 101),
+			"tcp": headerTCP + "\n" + row(v4Loopback, 8080, "0A", 101),
 		},
 		"only a neighbour port": {
-			"tcp": headerTCP + "\n" + row("0100007F", 8081, "0A", 102),
+			"tcp": headerTCP + "\n" + row(v4Loopback, 8081, "0A", 102),
 		},
 		"only a neighbour address": {
-			"tcp": headerTCP + "\n" + row("0302010A", 8080, "0A", 103),
+			"tcp": headerTCP + "\n" + row(v4Other, 8080, "0A", 103),
 		},
 		"neighbour protocol only": {
 			"tcp": headerTCP + "\n",
-			"udp": headerTCP + "\n" + row("0100007F", 8080, "07", 104),
+			"udp": headerTCP + "\n" + row(v4Loopback, 8080, "07", 104),
 		},
 		"ipv6 wildcard shadow": {
 			"tcp":  headerTCP + "\n",
-			"tcp6": headerTCP + "\n" + row("00000000000000000000000000000000", 8080, "0A", 105),
+			"tcp6": headerTCP + "\n" + row(v6Any, 8080, "0A", 105),
 		},
 		"time-wait only": {
-			"tcp": headerTCP + "\n" + row("0100007F", 8080, "06", 0),
+			"tcp": headerTCP + "\n" + row(v4Loopback, 8080, "06", 0),
 		},
 		"listener plus noise": {
 			"tcp": headerTCP + "\n" +
-				row("0100007F", 8080, "0A", 106) +
-				"\n" + row("0302010A", 8080, "01", 107) +
-				"\n" + row("0100007F", 8081, "0A", 108),
+				row(v4Loopback, 8080, "0A", 106) +
+				"\n" + row(v4Other, 8080, "01", 107) +
+				"\n" + row(v4Loopback, 8081, "0A", 108),
 		},
 	}
 	for name, files := range cases {
@@ -109,15 +137,39 @@ func TestAllFlagNeverChangesTheAnswer(t *testing.T) {
 	}
 }
 
+// The v6 case in the table above spent its first life comparing two unknowns: its
+// peer column carried 8 hex chars in a tcp6 table, so the table never parsed and
+// "with --all" equalled "without --all" for the wrong reason. A fixture that does
+// not parse is worse than no fixture — it buys a green test and no coverage. This
+// pins that the row parses and that it really is a shadow.
+func TestInjectedIPv6WildcardIsARealShadow(t *testing.T) {
+	dir := tablesDir(t, map[string]string{
+		"tcp":  headerTCP + "\n",
+		"tcp6": headerTCP + "\n" + row(v6Any, 8080, "0A", 105),
+	})
+	code, out, errb := runCLI(t, "why", "127.0.0.1:8080", "-json", "-tables", dir,
+		"-sysctl", sysctlDir(t, "0\n"), "-no-holders")
+	if code != exitTaken {
+		t.Fatalf("exit = %d, want %d (stderr: %s)\n%s", code, exitTaken, errb, out)
+	}
+	var rep allReport
+	if err := json.Unmarshal([]byte(out), &rep); err != nil {
+		t.Fatalf("not JSON: %v\n%s", err, out)
+	}
+	if rep.Kind != "listening" {
+		t.Errorf("kind = %q, want listening: the fixture did not produce a shadow", rep.Kind)
+	}
+}
+
 // Every row on the port gets a machine-readable reason. A user greps these; prose
 // in that column would be unusable in a script.
 func TestAllRowsCarryTheirMatchCode(t *testing.T) {
 	dir := tablesDir(t, map[string]string{
 		"tcp": headerTCP + "\n" +
-			row("0100007F", 8080, "0A", 201) + // matched
-			"\n" + row("0302010A", 8080, "0A", 202) + // other-address
-			"\n" + rowPeer("0100007F", 45678, "0100007F", 8080, "01", 203), // other-port: a connection to it
-		"udp": headerTCP + "\n" + row("0100007F", 8080, "07", 204), // other-proto
+			row(v4Loopback, 8080, "0A", 201) + // matched
+			"\n" + row(v4Other, 8080, "0A", 202) + // other-address
+			"\n" + rowPeer(v4Loopback, 45678, v4Loopback, 8080, "01", 203), // other-port: a connection to it
+		"udp": headerTCP + "\n" + row(v4Loopback, 8080, "07", 204), // other-proto
 	})
 	code, out, errb := runCLI(t, "why", "127.0.0.1:8080", "-json", "-all", "-tables", dir, "-no-holders")
 	if code != exitTaken {
@@ -237,7 +289,7 @@ func TestFreeDisclosesTheUnlistedBindingCaveat(t *testing.T) {
 		t.Errorf("free answer hides the bind-without-listen blind spot:\n%s", out)
 	}
 
-	taken := tablesDir(t, map[string]string{"tcp": headerTCP + "\n" + row("0100007F", 8080, "0A", 301)})
+	taken := tablesDir(t, map[string]string{"tcp": headerTCP + "\n" + row(v4Loopback, 8080, "0A", 301)})
 	if _, out, _ := runCLI(t, "why", "127.0.0.1:8080", "-tables", taken, "-no-holders"); strings.Contains(out, "bound without listen()") {
 		t.Errorf("listening answer carries the free-answer caveat:\n%s", out)
 	}
