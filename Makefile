@@ -88,8 +88,16 @@ build-check:
 lint:
 	golangci-lint run ./...
 
+# The documents are checked by internal/docs, and its tests already run as part of
+# `test`. This target is a name for that gate, not a second implementation of it:
+# when it fails you want the broken claim without the noise of the other 500
+# tests. It fails closed — a missing README or an empty docs/ is an error.
+.PHONY: docs-check
+docs-check:
+	$(GO) test -count=1 -run 'TestRepositoryDocuments|TestCheck' ./internal/docs/
+
 .PHONY: ci
-ci: fmt-check vet test-noskip race deps-check build-check lint
+ci: fmt-check vet test-noskip race deps-check build-check docs-check lint
 
 .PHONY: clean
 clean:
