@@ -31,6 +31,13 @@ jobs:
       - name: Cross-compile
         run: make build-check
 
+      - name: README commands
+        # The README is a transcript, and a transcript nobody executes is a
+        # rumour. The script builds its own binary, injects every table and
+        # tunable, and binds its own sockets — including the two that must touch
+        # the live kernel — so it asserts the same thing on any runner.
+        run: make readme
+
       - name: Exit-code contract
         # The exit codes are the interface: a script branches on them. This step
         # asserts the two that are easy to break silently — "taken" is 1, and

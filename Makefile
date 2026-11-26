@@ -97,7 +97,14 @@ docs-check:
 	$(GO) test -count=1 -run 'TestRepositoryDocuments|TestCheck' ./internal/docs/
 
 .PHONY: ci
-ci: fmt-check vet test-noskip race deps-check build-check docs-check lint
+ci: fmt-check vet test-noskip race deps-check build-check docs-check readme lint
+
+# Every command the README prints, executed once, with the exit code as the
+# assertion. It builds its own binary and binds its own sockets, so it is honest
+# about a machine it has never seen — see the header of the script.
+.PHONY: readme
+readme:
+	bash scripts/readme-rehearsal.sh
 
 .PHONY: clean
 clean:

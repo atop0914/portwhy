@@ -123,8 +123,7 @@ func Check(root string) (Report, error) {
 
 	readmeTargets := map[string]bool{}
 
-	var scan func(abs string) error
-	scan = func(abs string) error {
+	scan := func(abs string) error {
 		rel, err := filepath.Rel(root, abs)
 		if err != nil {
 			return err
