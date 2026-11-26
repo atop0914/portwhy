@@ -699,3 +699,21 @@ judgement and arrives as a three-state value: measured-present,
 measured-absent, or not measured at all. See [docs/design.md](docs/design.md) for
 the decisions behind that split and the cases this version deliberately refuses to
 answer.
+
+## How this document is checked
+
+Three gates, each about a claim that would otherwise be trusted:
+
+- `internal/docs` checks the documents against the tree they describe: every
+  relative link resolves, every inline-code repository path exists, and the
+  README reaches [the design](docs/design.md) and
+  [the JSON contract](docs/json-schema.md). It fails closed — a missing README or
+  an empty `docs/` is an error, not an empty issue list — because a checker that
+  reports "clean" when it could not read its input turns unknown into clean.
+- `scripts/readme-rehearsal.sh` executes every `portwhy` command printed in this
+  document and asserts the exit code, with all four codes represented. It injects
+  every table and tunable and binds its own sockets, so its result does not depend
+  on the machine it runs on.
+- [docs/ci.md](docs/ci.md) records what the CI jobs actually ran, read from the
+  check-runs API rather than from the workflow file — a workflow says what was
+  declared, a check-run says what happened.

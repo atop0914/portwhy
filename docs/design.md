@@ -189,30 +189,43 @@ Three consequences follow, and all three are tests rather than intentions:
 #### What a round costs, and why the floor is 50ms
 
 A round is: read the four tables, read four tunables, walk `/proc` for the holder
-index, judge, and make one real `bind()`. Measured in this container (an idle
-namespace with two processes and no sockets), `golang:1.25` on the host's kernel:
+index, judge, and make one real `bind()`. The numbers below come from benchmarks
+in the repository, not from a one-off program that has since been deleted — the
+difference matters, because a number nobody can reproduce is a number that
+quietly stops being true.
 
-| step | cost |
-|---|---|
-| `procnet.ReadAll` (4 tables) | ~880µs — of which `tcp` and `tcp6` are ~220µs each, and `udp`/`udp6` ~15µs |
-| `sockid.Scan` over `/proc` | ~110µs |
-| four tunable reads | ~20µs |
-| one plain `bind()` + `close()` | ~5µs |
-| **total** | **~1ms** |
+```
+go test -run=^$ -bench . -benchmem -benchtime=200x -count=3 ./internal/procnet/ ./internal/sockid/
+```
 
-The number that matters is not the total but its shape. Opening the file costs
-5µs; the 220µs is the kernel walking its socket tables to *generate* the text, and
-it grows with the number of sockets in the namespace, not with our parser. The
-holder walk grows with processes × descriptors. Neither is something the tool can
-cache between rounds without describing an older instant — which is the whole point
-of re-reading.
+Medians of three runs, `golang:1.25` in a container on this host:
 
-So the 50ms floor is roughly fifty times the measured cost, and that is deliberate:
-it is not there to protect the CPU, it is there so that a `wait` cannot turn into
-50 real `bind()` calls a second against a service the caller cares about. A lower
-floor would buy precision nobody asked for and pay for it in side effects. On a
-busy host the round gets slower and the floor stops mattering, which is the right
-way for the two to relate.
+| step | benchmark | median |
+|---|---|---|
+| four tables, live `/proc/net` | `BenchmarkReadAll/live` | **1.02ms** (964µs–1.03ms) |
+| four tables, fixture files | `BenchmarkReadAll/fixture` | 29.7µs |
+| parsing one captured table (3 rows, 486B) | `BenchmarkParse` | 2.9µs (169MB/s) |
+| the holder walk | `BenchmarkScan` | 128µs |
+| encoding one address | `BenchmarkFormatAddr` | 285ns |
+
+The live-versus-fixture gap is the whole story of this section: the same parser
+over the same bytes costs 30µs from disk and 1ms from `/proc/net`, because the
+cost is the kernel *generating* the text, not reading it. A round is therefore
+dominated by syscalls this tool does not control, and the only way to make it
+cheaper is to read fewer tables — which would be answering about an older
+instant, the thing re-reading exists to avoid.
+
+The earlier draft of this section quoted ~880µs total from a one-off measurement
+(`.cache/evidence/roundcost`, not in the repository). The benchmark says ~1.02ms
+for the tables alone. Both are honest readings of a machine at different moments;
+only one of them can be re-run, so that is the one that stayed.
+
+So the 50ms floor is roughly fifty times the measured cost, and that is
+deliberate: it is not there to protect the CPU, it is there so that a `wait`
+cannot turn into 50 real `bind()` calls a second against a service the caller
+cares about. A lower floor would buy precision nobody asked for and pay for it in
+side effects. On a busy host the round gets slower and the floor stops mattering,
+which is the right way for the two to relate.
 
 ### The IPv6 wildcard: one tunable, three answers
 
