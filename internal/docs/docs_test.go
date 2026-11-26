@@ -154,6 +154,16 @@ func TestCheckWildcardsHaveToMatchSomething(t *testing.T) {
 	if !hasIssue(rep, RulePath, "internal/*/missing.go") {
 		t.Fatalf("a wildcard matching nothing was not reported: %v", rep.Issues)
 	}
+
+	// A placeholder must be a wildcard, not a free pass: `internal/nope/<Target>/`
+	// claims a directory that does not exist, and treating `<...>` as "cannot be
+	// checked" would make every such sentence unverifiable.
+	write(t, root, "README.md", "# demo\n\n[the design](docs/design.md) [the schema](docs/json-schema.md)\n\n"+
+		"see `internal/nope/<Target>/`\n")
+	rep = mustCheck(t, root)
+	if !hasIssue(rep, RulePath, "internal/nope/<Target>/") {
+		t.Fatalf("a placeholder path with nothing behind it was not reported: %v", rep.Issues)
+	}
 }
 
 func TestCheckReportsAReadmeThatCannotReachTheDesign(t *testing.T) {
