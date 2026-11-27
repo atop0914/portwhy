@@ -4,7 +4,9 @@ PKG := github.com/atop0914/portwhy
 PLATFORMS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "")
+# The full SHA, not --short: internal/version decides how much of it is printed,
+# so `make build` and `go install` describe the same release with the same string.
+COMMIT  ?= $(shell git rev-parse HEAD 2>/dev/null || echo "")
 DATE    ?= $(shell git log -1 --format=%cI 2>/dev/null || echo "")
 LDFLAGS := -s -w \
 	-X $(PKG)/internal/version.Version=$(VERSION) \

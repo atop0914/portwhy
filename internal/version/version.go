@@ -30,19 +30,45 @@ type Info struct {
 // established are left empty rather than filled with a placeholder: a printed
 // "unknown" is a fact, a printed "dev" on a released binary is a lie.
 func Resolve() Info {
-	info := Info{Version: Version, Commit: Commit, Date: Date}
-	if Version != "" && Version != "dev" {
+	bi, ok := debug.ReadBuildInfo()
+	return resolve(Version, Commit, Date, bi, ok)
+}
+
+// commitWidth is how much of a revision is printed. It lives here, not in the
+// Makefile, because two places deciding it is how one release ends up described
+// by a 7-character commit in one binary and a 12-character one in the next.
+const commitWidth = 12
+
+// shortenCommit keeps a revision that is already short, and cuts a full one to
+// commitWidth. Cutting a 7-character value to 12 would produce a commit that
+// does not exist; that is worse than no commit at all.
+func shortenCommit(rev string) string {
+	if len(rev) > commitWidth {
+		return rev[:commitWidth]
+	}
+	return rev
+}
+
+// resolve is Resolve with its three inputs handed in, because a test cannot
+// inject a build info record through the real one. Every field below exists to
+// keep one promise: the same release is spelled the same way no matter which
+// source answered. `go install ...@v1.0.0` yields Main.Version "v1.0.0" and
+// `git describe --tags` yields "v1.0.0"; stripping the "v" from one of them
+// would print two different strings for one release, and the release-day
+// check (`portwhy version` must say v1.0.0) would depend on how it was built.
+func resolve(injVersion, injCommit, injDate string, bi *debug.BuildInfo, hasBuildInfo bool) Info {
+	info := Info{Version: injVersion, Commit: shortenCommit(injCommit), Date: injDate}
+	if injVersion != "" && injVersion != "dev" {
 		info.Source = "ldflags"
 		return info
 	}
 
-	bi, ok := debug.ReadBuildInfo()
-	if !ok {
+	if !hasBuildInfo || bi == nil {
 		info.Source = "none"
 		return info
 	}
 	if v := bi.Main.Version; v != "" && v != "(devel)" {
-		info.Version = strings.TrimPrefix(v, "v")
+		info.Version = v
 		info.Source = "buildinfo"
 	} else {
 		info.Version = "dev"
@@ -52,11 +78,7 @@ func Resolve() Info {
 		switch s.Key {
 		case "vcs.revision":
 			if info.Commit == "" {
-				if len(s.Value) > 12 {
-					info.Commit = s.Value[:12]
-				} else {
-					info.Commit = s.Value
-				}
+				info.Commit = shortenCommit(s.Value)
 			}
 		case "vcs.time":
 			if info.Date == "" {
