@@ -489,11 +489,19 @@ Two things follow from that, and they are the design:
 ## Install
 
 ```
-go install github.com/atop0914/portwhy/cmd/portwhy@latest
+go install github.com/atop0914/portwhy/cmd/portwhy@v1.0.0
 ```
+
+The pin is deliberate: `@latest` resolves to the same release today, but a report
+someone else has to reproduce should name the version it came from. A binary
+installed this way reports `v1.0.0` — the fix that made that true is in the
+changelog, because the version used to be printed two different ways.
 
 Zero third-party dependencies, no cgo. Linux only: the whole answer comes from
 `/proc`.
+
+What is in this release, and what each part refuses to claim:
+[CHANGELOG.md](CHANGELOG.md).
 
 ## Usage
 

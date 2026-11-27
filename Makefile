@@ -108,6 +108,13 @@ ci: fmt-check vet test-noskip race deps-check build-check docs-check readme lint
 readme:
 	bash scripts/readme-rehearsal.sh
 
+# Everything that can only be wrong on a release day: the tag is at HEAD, the
+# changelog starts at that tag, a binary built there reports it, dev and main
+# agree. Not part of `ci` — a tag does not exist until after the gates pass.
+.PHONY: release-check
+release-check:
+	bash scripts/release-check.sh
+
 .PHONY: clean
 clean:
 	rm -rf bin
